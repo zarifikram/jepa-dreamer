@@ -209,7 +209,7 @@ def make_env(config, mode, id):
 
 def main(config):
     
-    wandb.init(project="dreamer", name=f"{config.task}")
+    wandb.init(project="dreamer", entity="jepa_chrmzikram", name=f"{config.task}")
     # wandb.init(project="dreamer", name=f"{config.task}", mode="disabled")
 
     tools.set_seed_everywhere(config.seed)
