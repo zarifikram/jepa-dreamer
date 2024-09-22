@@ -309,7 +309,7 @@ def main(config):
     # make sure eval will be executed once after config.steps
     while agent._step < config.steps + config.eval_every:
         logger.write()
-        if config.eval_episode_num > 0:
+        if config.eval_episode_num > 0 and agent._step > 12000: # hacky solution
             print("Start evaluation.")
             eval_policy = functools.partial(agent, training=False)
             tools.simulate(
