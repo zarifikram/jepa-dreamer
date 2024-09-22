@@ -64,7 +64,6 @@ class WorldModel(nn.Module):
             config.device,
         )
 
-
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
@@ -283,6 +282,12 @@ class WorldModel(nn.Module):
                 kl=kl_value,
                 postent=self.dynamics.get_dist(post).entropy(),
             )
+        # Doesn't work:(
+        # if self._use_atp_loss:
+        #     embed = self.encoder.forward_with_target(data)
+        #     post, prior = self.dynamics.observe(
+        #         embed, data["action"], data["is_first"]
+        #     )
         post = {k: v.detach() for k, v in post.items()}
         return post, context, metrics
 

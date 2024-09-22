@@ -378,7 +378,6 @@ class MultiEncoder(nn.Module):
             outputs = torch.cat(outputs, -1)
             self.on_after_backward()
                 
-
             return outputs
         
 
@@ -391,10 +390,19 @@ class MultiEncoder(nn.Module):
             outputs.append(self._mlp(inputs))
         outputs = torch.cat(outputs, -1)
         return outputs
+    
+    def forward_with_target(self, obs):
+        outputs = []
+        with torch.no_grad():
+            if self.cnn_shapes:
+                inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
+                outputs.append(self._target_cnn(inputs))
+        outputs = torch.cat(outputs, -1)
+        return outputs
 
     def calculate_atc_loss(self, obs, K:int):
         assert self._use_atp_loss, "This method is only for ATP loss"
-        self.update_momentum(self.tau)
+        self.update_momentum(self.tau) 
 
         anchor, positive = obs[:, :-K], obs[:, K:]
         # B, T, H, W, C

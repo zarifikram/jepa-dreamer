@@ -9,11 +9,11 @@ defaults:
   deterministic_run: False
   steps: 1e6
   parallel: False
-  eval_every: 1e4
+  eval_every: 1e5
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
-  device: 'cuda:4'
+  device: 'cuda:2'
   compile: True
   precision: 32
   debug: False
@@ -236,4 +236,6 @@ icm:
 atp:
   use_atp_loss: True
   atp_tau: 0.01
+
+
   
