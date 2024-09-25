@@ -209,7 +209,7 @@ def make_env(config, mode, id):
 
 def main(config):
     
-    wandb.init(project="dreamer", name=f"{config.task}")
+    wandb.init(project="dreamer", name=f"{config.task}_seed{config.seed}")
     # wandb.init(project="dreamer", name=f"{config.task}", mode="disabled")
 
     tools.set_seed_everywhere(config.seed)
@@ -307,7 +307,7 @@ def main(config):
         agent._should_pretrain._once = False
 
     # make sure eval will be executed once after config.steps
-    while agent._step < config.steps + config.eval_every:
+    while agent._step < config.steps + 20000:
         logger.write()
         if config.eval_episode_num > 0 and agent._step > 12000: # hacky solution
             print("Start evaluation.")
