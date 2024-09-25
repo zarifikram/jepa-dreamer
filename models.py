@@ -91,14 +91,14 @@ class WorldModel(nn.Module):
 
         self._use_atp_loss = config.use_atp_loss
         if self._use_atp_loss:
-            self.encoder.tau = config.atp_tau
+            self.encoder.set_tau(config.atp_tau)
 
 
         self._use_acro_loss = config.use_acro_loss
         if self._use_acro_loss:
             self.acro_K = config.acro_K
             self.bc_predictor = BehaviorCloneActionHead(
-                feat_size,
+                feat_size,r.    
                 act_space.shape,
                 config.actor_layers,
                 config.units,

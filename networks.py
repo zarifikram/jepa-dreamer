@@ -364,6 +364,10 @@ class MultiEncoder(nn.Module):
         self.m = self.m_start
 
         self.pad = 4
+
+    def set_tau(self, tau):
+        self.tau = tau
+        self.Contrast.tau = tau
     
 
     def forward(self, obs):
@@ -458,6 +462,8 @@ class MultiEncoder(nn.Module):
         elif self.mlp_shapes:
             for target_param, param in zip(self._target_mlp.parameters(), self._mlp.parameters()):
                 target_param.data = m * param.data + (1 - m) * target_param.data
+
+        self.Contrast.update_momentum(m)
 
 class MultiDecoder(nn.Module):
     def __init__(

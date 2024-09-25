@@ -1,6 +1,6 @@
 import numpy as np
 import torch 
-
+import copy
 
 def numpify(func):
     """Wrapper so that the augmentation function always works on a numpy
@@ -74,8 +74,16 @@ def random_shift(imgs, pad=1, prob=1.):
 
 class ContrastModel(torch.nn.Module):
 
-    def __init__(self, latent_size:int, anchor_hidden_size:int):
+    def __init__(self, latent_size:int, anchor_hidden_size:int, tau:float=1.0):
         super().__init__()
+        self.projector = torch.nn.Linear(latent_size, 256)
+        # no gradient to projector target
+        self.projector_target = copy.deepcopy(self.projector)
+        for param in self.projector_target.parameters():
+            param.requires_grad = False
+
+        latent_size = 256
+
         self.anchor_mlp = torch.nn.Sequential(
             torch.nn.Linear(latent_size, anchor_hidden_size),
             torch.nn.ReLU(),
@@ -84,7 +92,10 @@ class ContrastModel(torch.nn.Module):
         self.W = torch.nn.Linear(latent_size, latent_size, bias=False)
         self.c_e_loss = torch.nn.CrossEntropyLoss()
 
+
     def forward(self, anchor, positive):
+        anchor = self.projector(anchor)
+        positive = self.projector_target(positive)
         if self.anchor_mlp is not None:
             anchor = anchor + self.anchor_mlp(anchor)  # skip probably helps
         pred = self.W(anchor)
@@ -102,6 +113,11 @@ class ContrastModel(torch.nn.Module):
         # correct = torch.argmax(logits.detach(), dim=1) == labels
         # accuracy = torch.mean(correct.float())
         return {"atc_loss": ul_loss}
+
+    def update_momentum(self, m):
+        for target_param, param in zip(self.projector_target.parameters(), self.projector.parameters()):
+            target_param.data = m * param.data + (1 - m) * target_param.data
+
 
 
 def update_state_dict(model, state_dict, tau=1, strip_ddp=True):
