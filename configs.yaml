@@ -13,11 +13,15 @@ defaults:
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
-  device: 'cuda:7'
+  device: 'cuda:6'
   compile: True
   precision: 32
   debug: False
   video_pred_log: True
+  use_pixel_shift: False
+  pixel_shift_prob: 0.2
+  wandb_exp: "default-exp"
+  wandb_proj: "default-proj"
 
   # Environment
   task: 'dmc_walker_walk'
@@ -219,6 +223,9 @@ updates:
 # atp
   use_atp_loss: False
 
+# shift pixel
+  use_pixel_shift: False
+
 mlr:
   use_mlr_loss: True
  
@@ -237,5 +244,6 @@ atp:
   use_atp_loss: True
   atp_tau: 0.01
 
-
-  
+pixel_shift:
+  use_pixel_shift: True
+  # pixel_shift_prob: 0.2

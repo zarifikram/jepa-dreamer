@@ -4,7 +4,7 @@ import os
 import pathlib
 import sys
 
-os.environ["MUJOCO_GL"] = "osmesa"
+os.environ["MUJOCO_GL"] = "egl"
 
 import numpy as np
 import ruamel.yaml as yaml
@@ -57,6 +57,7 @@ class Dreamer(nn.Module):
             random=lambda: expl.Random(config, act_space),
             plan2explore=lambda: expl.Plan2Explore(config, self._wm, reward),
         )[config.expl_behavior]().to(self._config.device)
+        self.config = config
 
     def __call__(self, obs, reset, state=None, training=True):
         step = self._step
@@ -92,8 +93,10 @@ class Dreamer(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
-        embed = self._wm.encoder.forward_with_target(obs)
-        # embed = self._wm.encoder(obs)
+        if self.config.use_atp_loss:
+            embed = self._wm.encoder.forward_with_target(obs)
+        else:
+            embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
@@ -209,7 +212,7 @@ def make_env(config, mode, id):
 
 def main(config):
     
-    wandb.init(project="dreamer", name=f"{config.task}_seed{config.seed}")
+    wandb.init(project=config.wandb_proj, name=config.wandb_exp)
     # wandb.init(project="dreamer", name=f"{config.task}", mode="disabled")
 
     tools.set_seed_everywhere(config.seed)

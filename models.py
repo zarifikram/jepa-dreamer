@@ -64,6 +64,10 @@ class WorldModel(nn.Module):
             config.device,
         )
 
+        self.use_pixel_shift = config.use_pixel_shift
+        if self.use_pixel_shift:
+            self.pixel_shift_prob = config.pixel_shift_prob
+
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
@@ -170,6 +174,18 @@ class WorldModel(nn.Module):
             reward=config.reward_head["loss_scale"],
             cont=config.cont_head["loss_scale"],
         )
+    
+    def random_pixel_shift(self, frames, shift_prob):
+        # Generate a mask where each pixel is marked to be shifted or not based on probability
+        mask = torch.rand(frames.shape) < shift_prob
+
+        # Generate random values for the pixels that will be shifted
+        random_values = torch.rand(frames.shape)
+
+        # Apply random values where the mask is True (pixels to be shifted)
+        shifted_frames = torch.where(mask, random_values, frames)
+
+        return shifted_frames
 
     def _train(self, data):
         # action (batch_size, batch_length, act_dim)
@@ -305,6 +321,8 @@ class WorldModel(nn.Module):
     def preprocess(self, obs):
         obs = obs.copy()
         obs["image"] = torch.Tensor(obs["image"]) / 255.0
+        if self.use_pixel_shift:
+            obs["image"] = self.random_pixel_shift(obs["image"], self.pixel_shift_prob)
         if "discount" in obs:
             obs["discount"] *= self._config.discount
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)
