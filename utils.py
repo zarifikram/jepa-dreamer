@@ -91,8 +91,8 @@ class ContrastModel(torch.nn.Module):
         )
         self.W = torch.nn.Linear(latent_size, latent_size, bias=False)
         self.c_e_loss = torch.nn.CrossEntropyLoss()
-
-
+        self.predictor = torch.nn.Linear(latent_size, latent_size)
+        
     def forward(self, anchor, positive):
         anchor = self.projector(anchor)
         positive = self.projector_target(positive)
@@ -109,10 +109,10 @@ class ContrastModel(torch.nn.Module):
 
         logits = self(anchor, positive)
         ul_loss = self.c_e_loss(logits, labels)
-        # print(f"logit shape {logits.shape} labels shape {labels.shape} loss shape {ul_loss.shape}")
-        # correct = torch.argmax(logits.detach(), dim=1) == labels
-        # accuracy = torch.mean(correct.float())
-        return {"atc_loss": ul_loss}
+
+        extra_loss = self.predictor(anchor[:-1], anchor[1:]).mean() + self.predictor(positive[:-1], positive[1:]).mean()
+
+        return {"atc_loss": ul_loss, "extra_loss": extra_loss}
 
     def update_momentum(self, m):
         for target_param, param in zip(self.projector_target.parameters(), self.projector.parameters()):
