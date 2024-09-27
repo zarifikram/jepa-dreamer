@@ -1,13 +1,16 @@
-game_name=bank_heist
+game_name=crazy_climber
 type=bottleneck_atc
+proj_name=ablation
+exp_name=atari_${game_name}
+use_extra_loss=True
 # nohup python dreamer.py --task=atari_${game_name} --configs atari100k updates atp debug --logdir ./logdir/${game_name}_${type} &> ./logdir/${game_name}_${type}.log 2> ./logdir/${game_name}_${type}.err
 
 # run it for three seeds concurrently 
-mkdir logdir
+#mkdir logdir
 
-for seed in 0 1
+for seed in 666
 do
-    nohup python dreamer.py --task=atari_${game_name} --seed ${seed} --configs atari100k updates atp --logdir /data/zikram/dreamer/${game_name}_${type}_seed${seed} &> ./logdir/${game_name}_${type}_seed${seed}.log 2> ./logdir/${game_name}_${type}_seed${seed}.err &
+    nohup python dreamer.py --task=atari_${game_name} --seed ${seed} --use_extra_loss ${use_extra_loss} --wandb_proj ${proj_name} --wandb_exp ${exp_name}_seed${seed} --configs atari100k updates atp debug --logdir ./logdir/${game_name}_${type}_seed${seed} &> ./logdir/${game_name}_${type}_seed${seed}.log 2> ./logdir/${game_name}_${type}_seed${seed}.err &
 done
 
  

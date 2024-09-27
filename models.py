@@ -97,6 +97,7 @@ class WorldModel(nn.Module):
         if self._use_atp_loss:
             self.encoder.set_tau(config.atp_tau)
 
+        self._use_extra_loss = config.use_extra_loss
 
         self._use_acro_loss = config.use_acro_loss
         if self._use_acro_loss:
@@ -222,7 +223,10 @@ class WorldModel(nn.Module):
                     embed = self.encoder(data)
 
                 if self._use_atp_loss:
-                    _mets.update(self.encoder.calculate_atc_loss(data["image"], K=4))
+                    if self._use_extra_loss:
+                        _mets.update(self.encoder.calculate_atc_loss(data["image"], K=4, extra=True))
+                    else:
+                        _mets.update(self.encoder.calculate_atc_loss(data["image"], K=4, extra=False))
                 
                 # embed = self.encoder(data)
                 post, prior = self.dynamics.observe(

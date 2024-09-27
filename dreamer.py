@@ -212,8 +212,8 @@ def make_env(config, mode, id):
 
 def main(config):
     
-    wandb.init(project=config.wandb_proj, name=config.wandb_exp)
-    # wandb.init(project="dreamer", name=f"{config.task}", mode="disabled")
+    #wandb.init(project=config.wandb_proj, entity="jepa_chrmzikram" name=config.wandb_exp)
+    wandb.init(project="dreamer", name=f"{config.task}", mode="disabled")
 
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:

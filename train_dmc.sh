@@ -1,11 +1,11 @@
-game_name=reacher_easy
-type=reacher_easy
+game_name=reacher_hard
+type=reacher_hard
 proj_name=dmc
 exp_name=${game_name}_atp
-nohup python dreamer.py --task=dmc_${game_name} --configs dmc_vision updates atp debug --logdir /data/zikram/dreamer/${exp_name} --wandb_proj ${proj_name} --wandb_exp ${exp_name}  &> ./logdir/${exp_name}.log 2> ./logdir/${exp_name}.err &
+nohup python dreamer.py --task=dmc_${game_name} --configs dmc_vision updates atp --logdir ./logdir/${exp_name} --wandb_proj ${proj_name} --wandb_exp ${exp_name}  &> ./logdir/${exp_name}.log 2> ./logdir/${exp_name}.err &
 
 exp_name=${game_name}_dv3
-nohup python dreamer.py --task=dmc_${game_name} --configs dmc_vision updates debug --logdir ./logdir/${exp_name} --wandb_proj ${proj_name} --wandb_exp ${exp_name}  &> ./logdir/${exp_name}.log 2> ./logdir/${exp_name}.err &
+nohup python dreamer.py --task=dmc_${game_name} --configs dmc_vision updates --logdir ./logdir/${exp_name} --wandb_proj ${proj_name} --wandb_exp ${exp_name}  &> ./logdir/${exp_name}.log 2> ./logdir/${exp_name}.err &
 # run it for three seeds concurrently 
 # mkdir logdir
 
@@ -20,3 +20,4 @@ nohup python dreamer.py --task=dmc_${game_name} --configs dmc_vision updates deb
 # python dreamer.py --task=atari_frostbite --configs atari100k updates icm --logdir ./logdir/atari-icm
  
     # nohup python dreamer.py --task=atari_${game_name} --seed ${seed} --configs atari100k updates atp --logdir ./logdir/${game_name}_${type}_seed${seed}  &> ./logdir/${game_name}_${type}_seed${seed}.log 2> ./logdir/${game_name}_${type}_seed${seed}.err
+

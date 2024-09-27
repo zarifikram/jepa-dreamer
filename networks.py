@@ -404,7 +404,7 @@ class MultiEncoder(nn.Module):
         outputs = torch.cat(outputs, -1)
         return outputs
 
-    def calculate_atc_loss(self, obs, K:int):
+    def calculate_atc_loss(self, obs, K:int, extra):
         assert self._use_atp_loss, "This method is only for ATP loss"
         self.update_momentum(self.tau) 
 
@@ -423,7 +423,7 @@ class MultiEncoder(nn.Module):
         with torch.no_grad():
             positive_latent = self._target_cnn(positive)
         
-        mets = self.Contrast.calculate_loss(anchor_latent, positive_latent)
+        mets = self.Contrast.calculate_loss(anchor_latent, positive_latent, extra)
         return mets
         
     def update_target(self):

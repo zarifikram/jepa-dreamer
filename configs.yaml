@@ -13,7 +13,7 @@ defaults:
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
-  device: 'cuda:6'
+  device: 'cuda:3'
   compile: True
   precision: 32
   debug: False
@@ -203,6 +203,10 @@ updates:
 # ICM
   use_icm_loss: False
   eta: 1.0
+
+# extra loss
+  use_extra_loss: True
+  
 
 # JEPA
   use_ijepa_loss: False

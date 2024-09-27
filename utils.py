@@ -103,16 +103,19 @@ class ContrastModel(torch.nn.Module):
         logits = logits - torch.max(logits, dim=1, keepdim=True)[0]  # normalize
         return logits
 
-    def calculate_loss(self, anchor, positive):
+    def calculate_loss(self, anchor, positive, extra):
         labels = torch.arange(anchor.shape[0],
             dtype=torch.long, device=anchor.device)
 
         logits = self(anchor, positive)
         ul_loss = self.c_e_loss(logits, labels)
-
+        
         extra_loss = self.predictor(anchor[:-1], anchor[1:]).mean() + self.predictor(positive[:-1], positive[1:]).mean()
 
-        return {"atc_loss": ul_loss, "extra_loss": extra_loss}
+        if extra:
+            return {"atc_loss": ul_loss, "extra_loss": extra_loss}
+        else: 
+            return {"atc_loss": ul_loss}
 
     def update_momentum(self, m):
         for target_param, param in zip(self.projector_target.parameters(), self.projector.parameters()):
