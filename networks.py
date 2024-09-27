@@ -410,6 +410,7 @@ class MultiEncoder(nn.Module):
 
         anchor, positive = obs[:, :-K], obs[:, K:]
         # B, T, H, W, C
+        B, T = anchor.shape[0], anchor.shape[1]
         anchor = rearrange(anchor, "B T H W C -> (B T) C H W")
         positive = rearrange(positive, "B T H W C -> (B T) C H W")
         device = anchor.device
@@ -423,7 +424,7 @@ class MultiEncoder(nn.Module):
         with torch.no_grad():
             positive_latent = self._target_cnn(positive)
         
-        mets = self.Contrast.calculate_loss(anchor_latent, positive_latent)
+        mets = self.Contrast.calculate_loss(anchor_latent, positive_latent, B, T)
         return mets
         
     def update_target(self):
