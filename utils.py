@@ -101,16 +101,30 @@ class ContrastModel(torch.nn.Module):
         pred = self.W(anchor)
         logits = torch.matmul(pred, positive.T)
         logits = logits - torch.max(logits, dim=1, keepdim=True)[0]  # normalize
-        return logits
+        return logits, anchor, positive
 
-    def calculate_loss(self, anchor, positive, extra):
+    def calculate_loss(self, anchor, positive, B, T):
         labels = torch.arange(anchor.shape[0],
             dtype=torch.long, device=anchor.device)
 
-        logits = self(anchor, positive)
+        logits, anchor, positive = self(anchor, positive)
         ul_loss = self.c_e_loss(logits, labels)
         
-        extra_loss = self.predictor(anchor[:-1], anchor[1:]).mean() + self.predictor(positive[:-1], positive[1:]).mean()
+        anchor = anchor.view(B, T, -1)
+        positive = positive.view(B, T, -1)
+
+        anchor_left, anchor_right = anchor[:, :-1], anchor[:, 1:]
+        positive_left, positive_right = positive[:, :-1], positive[:, 1:]
+
+        anchor_left = anchor_left.view(B * (T - 1), -1)
+        anchor_right = anchor_right.view(B * (T - 1), -1)
+        positive_left = positive_left.view(B * (T - 1), -1)
+        positive_right = positive_right.view(B * (T - 1), -1)
+
+        anchor_right_pred = self.predictor(anchor_left)
+        positive_right_pred = self.predictor(positive_left)
+
+        extra_loss = torch.nn.functional.mse_loss(anchor_right_pred, anchor_right) + torch.nn.functional.mse_loss(positive_right_pred, positive_right)
 
         if extra:
             return {"atc_loss": ul_loss, "extra_loss": extra_loss}
