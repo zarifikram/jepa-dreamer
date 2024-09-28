@@ -159,6 +159,15 @@ def make_env(config, mode, id):
             task, config.action_repeat, config.size, seed=config.seed + id
         )
         env = wrappers.NormalizeActions(env)
+    elif suite == "ddmc":
+        from envs.distracting_control.distracting_dmc import DeepMindControl
+
+        env = DeepMindControl(
+            task, config.action_repeat, config.size, seed=config.seed + id
+        )
+        print(f"loaded")
+        env = wrappers.NormalizeActions(env)
+        print(f"normalized")
     elif suite == "atari":
         import envs.atari as atari
 
@@ -213,7 +222,7 @@ def make_env(config, mode, id):
 def main(config):
     
     wandb.init(project=config.wandb_proj, name=config.wandb_exp)
-    # wandb.init(project="dreamer", name=f"{config.task}", mode="disabled")
+    # wandb.init(project=config.wandb_proj, name=config.wandb_exp, mode="disabled")
 
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:

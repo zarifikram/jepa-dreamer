@@ -15,9 +15,8 @@ source $HOME/scratch/dmr/bin/activate
 mkdir logdir
 
 game_name=$1
-prob=$2
-seed=$3
-exp_name=${game_name}_prob${prob}_dv3_${seed}
-proj_name=robustness
-type=atp
-nohup python dreamer.py --task=atari_${game_name} --pixel_shift_prob ${prob} --wandb_proj ${proj_name} --wandb_exp ${exp_name} --configs atari100k updates pixel_shift atp --logdir ./logdir/${exp_name} &> ./logdir/${exp_name}.log 2> ./logdir/${exp_name}.err
+seed=$2
+exp_name=ddmc_${game_name}_dv3_${seed}
+proj_name=ddmc
+type=dv3
+nohup python dreamer.py --task=ddmc_${game_name} --wandb_proj ${proj_name} --wandb_exp ${exp_name} --configs dmc_vision debug updates --logdir ./logdir/${exp_name} &> ./logdir/${exp_name}.log 2> ./logdir/${exp_name}.err

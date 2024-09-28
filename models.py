@@ -67,6 +67,7 @@ class WorldModel(nn.Module):
         self.use_pixel_shift = config.use_pixel_shift
         if self.use_pixel_shift:
             self.pixel_shift_prob = config.pixel_shift_prob
+            print(f"pixel shift prob {self.pixel_shift_prob}")
 
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
@@ -102,7 +103,7 @@ class WorldModel(nn.Module):
         if self._use_acro_loss:
             self.acro_K = config.acro_K
             self.bc_predictor = BehaviorCloneActionHead(
-                feat_size,r.    
+                feat_size,   
                 act_space.shape,
                 config.actor_layers,
                 config.units,

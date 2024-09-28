@@ -110,23 +110,23 @@ class ContrastModel(torch.nn.Module):
         logits, anchor, positive = self(anchor, positive)
         ul_loss = self.c_e_loss(logits, labels)
         
-        anchor = anchor.view(B, T, -1)
-        positive = positive.view(B, T, -1)
+        # anchor = anchor.view(B, T, -1)
+        # positive = positive.view(B, T, -1)
 
-        anchor_left, anchor_right = anchor[:, :-1], anchor[:, 1:]
-        positive_left, positive_right = positive[:, :-1], positive[:, 1:]
+        # anchor_left, anchor_right = anchor[:, :-1], anchor[:, 1:]
+        # positive_left, positive_right = positive[:, :-1], positive[:, 1:]
 
-        anchor_left = anchor_left.view(B * (T - 1), -1)
-        anchor_right = anchor_right.view(B * (T - 1), -1)
-        positive_left = positive_left.view(B * (T - 1), -1)
-        positive_right = positive_right.view(B * (T - 1), -1)
+        # anchor_left = anchor_left.view(B * (T - 1), -1)
+        # anchor_right = anchor_right.view(B * (T - 1), -1)
+        # positive_left = positive_left.view(B * (T - 1), -1)
+        # positive_right = positive_right.view(B * (T - 1), -1)
 
-        anchor_right_pred = self.predictor(anchor_left)
-        positive_right_pred = self.predictor(positive_left)
+        # anchor_right_pred = self.predictor(anchor_left)
+        # positive_right_pred = self.predictor(positive_left)
 
-        extra_loss = torch.nn.functional.mse_loss(anchor_right_pred, anchor_right) + torch.nn.functional.mse_loss(positive_right_pred, positive_right)
+        # extra_loss = torch.nn.functional.mse_loss(anchor_right_pred, anchor_right) + torch.nn.functional.mse_loss(positive_right_pred, positive_right)
 
-        return {"atc_loss": ul_loss, "extra_loss": extra_loss}
+        return {"atc_loss": ul_loss}
 
     def update_momentum(self, m):
         for target_param, param in zip(self.projector_target.parameters(), self.projector.parameters()):
