@@ -138,3 +138,5 @@ dmypy.json
 .vscode/*
 
 wandb/
+
+distracting_control/DAVI
