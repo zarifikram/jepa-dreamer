@@ -95,6 +95,7 @@ class WorldModel(nn.Module):
             self.byol_loss = networks.SPRPred(input_size = self.embed_size, output_size = 256).to(config.device)
 
         self._use_atp_loss = config.use_atp_loss
+        self.atc_K = config.atc_K
         if self._use_atp_loss:
             self.encoder.set_tau(config.atp_tau)
 
@@ -223,7 +224,7 @@ class WorldModel(nn.Module):
                     embed = self.encoder(data)
 
                 if self._use_atp_loss:
-                    _mets.update(self.encoder.calculate_atc_loss(data["image"], K=4))
+                    _mets.update(self.encoder.calculate_atc_loss(data["image"], K=self.atc_K))
                 
                 # embed = self.encoder(data)
                 post, prior = self.dynamics.observe(
