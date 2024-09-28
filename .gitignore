@@ -139,4 +139,5 @@ dmypy.json
 
 wandb/
 
-distracting_control/DAVI
+envs/distracting_control/DAVIS
+data/
