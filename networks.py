@@ -424,7 +424,7 @@ class MultiEncoder(nn.Module):
         with torch.no_grad():
             positive_latent = self._target_cnn(positive)
         
-        mets = self.Contrast.calculate_loss(anchor_latent, positive_latent, B, T)
+        mets = self.Contrast.calculate_loss(anchor_latent, positive_latent, B, T, extra)
         return mets
         
     def update_target(self):

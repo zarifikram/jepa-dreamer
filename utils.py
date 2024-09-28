@@ -103,7 +103,7 @@ class ContrastModel(torch.nn.Module):
         logits = logits - torch.max(logits, dim=1, keepdim=True)[0]  # normalize
         return logits, anchor, positive
 
-    def calculate_loss(self, anchor, positive, B, T):
+    def calculate_loss(self, anchor, positive, B, T, extra):
         labels = torch.arange(anchor.shape[0],
             dtype=torch.long, device=anchor.device)
 
@@ -116,10 +116,10 @@ class ContrastModel(torch.nn.Module):
         anchor_left, anchor_right = anchor[:, :-1], anchor[:, 1:]
         positive_left, positive_right = positive[:, :-1], positive[:, 1:]
 
-        anchor_left = anchor_left.view(B * (T - 1), -1)
-        anchor_right = anchor_right.view(B * (T - 1), -1)
-        positive_left = positive_left.view(B * (T - 1), -1)
-        positive_right = positive_right.view(B * (T - 1), -1)
+        anchor_left = anchor_left.reshape(B * (T - 1), -1)
+        anchor_right = anchor_right.reshape(B * (T - 1), -1)
+        positive_left = positive_left.reshape(B * (T - 1), -1)
+        positive_right = positive_right.reshape(B * (T - 1), -1)
 
         anchor_right_pred = self.predictor(anchor_left)
         positive_right_pred = self.predictor(positive_left)
