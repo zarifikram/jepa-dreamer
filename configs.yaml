@@ -224,8 +224,8 @@ updates:
   patch_size: 8
   mask_ratio: 0.5
 
-# atp
-  use_atp_loss: False
+# atc
+  use_atc_loss: False
 
 # shift pixel
   use_pixel_shift: False
@@ -244,9 +244,9 @@ icm:
   actor_dist: 'onehot'
   eta: 1.0
 
-atp:
-  use_atp_loss: True
-  atp_tau: 0.01
+atc:
+  use_atc_loss: True
+  atc_tau: 0.01
 
 pixel_shift:
   use_pixel_shift: True

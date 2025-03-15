@@ -93,7 +93,7 @@ class Dreamer(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
-        if self.config.use_atp_loss:
+        if self.config.use_atc_loss:
             embed = self._wm.encoder.forward_with_target(obs)
         else:
             embed = self._wm.encoder(obs)

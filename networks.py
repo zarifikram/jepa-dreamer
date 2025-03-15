@@ -309,7 +309,7 @@ class MultiEncoder(nn.Module):
         symlog_inputs,
         device,
         use_mlr_loss: bool = False,
-        use_atp_loss: bool = False
+        use_atc_loss: bool = False
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
@@ -330,7 +330,7 @@ class MultiEncoder(nn.Module):
         print("Encoder MLP shapes:", self.mlp_shapes)
 
         self._use_mlr_loss = use_mlr_loss
-        self._use_atp_loss = use_atp_loss
+        self._use_atc_loss = use_atc_loss
         self.outdim = 0
         if self.cnn_shapes:
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
@@ -338,7 +338,7 @@ class MultiEncoder(nn.Module):
             self._cnn = ConvEncoder(
                 input_shape, cnn_depth, act, norm, kernel_size, minres
             )
-            if self._use_mlr_loss or self._use_atp_loss:
+            if self._use_mlr_loss or self._use_atc_loss:
                 self._target_cnn = copy.deepcopy(self._cnn).to(device)
             self.outdim += self._cnn.outdim
         if self.mlp_shapes:
@@ -357,7 +357,7 @@ class MultiEncoder(nn.Module):
                 self._target_mlp = copy.deepcopy(self._mlp).to(device)
             self.outdim += mlp_units
 
-        if self._use_atp_loss:
+        if self._use_atc_loss:
             self.Contrast = ContrastModel(self.outdim, 1024)
         
         self.m_start, self.m_end = 0.5, 1.0
@@ -405,7 +405,7 @@ class MultiEncoder(nn.Module):
         return outputs
 
     def calculate_atc_loss(self, obs, K:int):
-        assert self._use_atp_loss, "This method is only for ATP loss"
+        assert self._use_atc_loss, "This method is only for ATP loss"
         self.update_momentum(self.tau) 
 
         anchor, positive = obs[:, :-K], obs[:, K:]
