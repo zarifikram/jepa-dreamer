@@ -20,6 +20,7 @@ defaults:
   video_pred_log: True
   use_pixel_shift: False
   pixel_shift_prob: 0.2
+  wandb_enabled: False
   wandb_exp: "default-exp"
   wandb_proj: "default-proj"
 
