@@ -93,7 +93,7 @@ class Dreamer(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
-        if self.config.use_atp_loss:
+        if self.config.use_atc_loss:
             embed = self._wm.encoder.forward_with_target(obs)
         else:
             embed = self._wm.encoder(obs)
@@ -221,8 +221,7 @@ def make_env(config, mode, id):
 
 def main(config):
     
-    wandb.init(config=config, project=config.wandb_proj, name=config.wandb_exp)
-    # wandb.init(config=config,, project=config.wandb_proj, name=config.wandb_exp, mode="disabled")
+    wandb.init(config=config, project=config.wandb_proj, name=config.wandb_exp, resume='allow', mode='online' if config.wandb_enabled else "disabled")
 
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:

@@ -43,7 +43,7 @@ class WorldModel(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         config.encoder["device"] = config.device
         config.encoder["use_mlr_loss"] = config.use_mlr_loss
-        config.encoder["use_atp_loss"] = config.use_atp_loss
+        config.encoder["use_atc_loss"] = config.use_atc_loss
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
         self.dynamics = networks.RSSM(
@@ -94,10 +94,10 @@ class WorldModel(nn.Module):
             self.position = PositionalEmbedding(self.embed_size)
             self.byol_loss = networks.SPRPred(input_size = self.embed_size, output_size = 256).to(config.device)
 
-        self._use_atp_loss = config.use_atp_loss
+        self._use_atc_loss = config.use_atc_loss
         self.atc_K = config.atc_K
-        if self._use_atp_loss:
-            self.encoder.set_tau(config.atp_tau)
+        if self._use_atc_loss:
+            self.encoder.set_tau(config.atc_tau)
 
 
         self._use_acro_loss = config.use_acro_loss
@@ -223,7 +223,7 @@ class WorldModel(nn.Module):
                 else:
                     embed = self.encoder(data)
 
-                if self._use_atp_loss:
+                if self._use_atc_loss:
                     _mets.update(self.encoder.calculate_atc_loss(data["image"], K=self.atc_K))
                 
                 # embed = self.encoder(data)
@@ -272,7 +272,7 @@ class WorldModel(nn.Module):
                     for key, value in losses.items()
                 }
                 model_loss = sum(scaled.values()) + kl_loss
-                if self._use_acro_loss or self._use_icm_loss or self._use_mlr_loss or self._use_atp_loss:
+                if self._use_acro_loss or self._use_icm_loss or self._use_mlr_loss or self._use_atc_loss:
                     for v in _mets.values():
                         model_loss += v
             metrics = self._model_opt(torch.mean(model_loss), self.parameters())
@@ -284,7 +284,7 @@ class WorldModel(nn.Module):
         metrics["dyn_loss"] = to_np(dyn_loss)
         metrics["rep_loss"] = to_np(rep_loss)
         metrics["kl"] = to_np(torch.mean(kl_value))
-        if self._use_acro_loss or self._use_icm_loss or self._use_mlr_loss or self._use_atp_loss:
+        if self._use_acro_loss or self._use_icm_loss or self._use_mlr_loss or self._use_atc_loss:
                 for k, v in _mets.items():
                     metrics[k] = to_np(v)
         with torch.cuda.amp.autocast(self._use_amp):
@@ -301,7 +301,7 @@ class WorldModel(nn.Module):
                 postent=self.dynamics.get_dist(post).entropy(),
             )
         # Doesn't work:(
-        # if self._use_atp_loss:
+        # if self._use_atc_loss:
         #     embed = self.encoder.forward_with_target(data)
         #     post, prior = self.dynamics.observe(
         #         embed, data["action"], data["is_first"]

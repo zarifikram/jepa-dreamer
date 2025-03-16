@@ -7,7 +7,7 @@ mkdir logdir
 
 for seed in 0 1
 do
-    nohup python dreamer.py --task=atari_${game_name} --seed ${seed} --configs atari100k updates atp --logdir /data/zikram/dreamer/${game_name}_${type}_seed${seed} &> ./logdir/${game_name}_${type}_seed${seed}.log 2> ./logdir/${game_name}_${type}_seed${seed}.err &
+    nohup python dreamer.py --task=atari_${game_name} --seed ${seed} --configs atari100k updates atc --logdir /data/zikram/dreamer/${game_name}_${type}_seed${seed} &> ./logdir/${game_name}_${type}_seed${seed}.log 2> ./logdir/${game_name}_${type}_seed${seed}.err &
 done
 
  
