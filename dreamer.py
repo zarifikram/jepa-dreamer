@@ -321,6 +321,7 @@ def main(config):
     while agent._step < config.steps + 20000:
         logger.write()
         if config.eval_episode_num > 0 and agent._step > 12000: # hacky solution
+        # if config.eval_episode_num > 0: 
             print("Start evaluation.")
             eval_policy = functools.partial(agent, training=False)
             tools.simulate(

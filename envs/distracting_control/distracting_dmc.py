@@ -15,15 +15,7 @@ class DeepMindControl:
         if domain == "cup":  # Only domain with multiple words.
             domain = "ball_in_cup"
 
-        # FLAGS = flags.FLAGS
 
-        # NOTE: This has been populated with the demo images path, but you should
-        # download and extract the DAVIS dataset and point this path to the location
-        # of DAVIS.
-        # flags.DEFINE_string(
-        #     'davis_path',
-        #     'distracting_control/DAVIS/JPEGImages/480p',
-        #     'Path to DAVIS images, used for background distractions.')
         if isinstance(domain, str):
             
 
@@ -34,14 +26,12 @@ class DeepMindControl:
             )
             import os
             cwd = os.getcwd()
-            print(f"cwd: {cwd}")
             self._env = suite.load(
                 domain, 
                 task, 
                 difficulty, 
-                background_dataset_path="/home/mila/d/dianbo.liu/scratch/jepa-dreamer/envs/distracting_control/DAVIS/JPEGImages/480p",
+                background_dataset_path="/home/zikram/dreamerv3-torch/envs/distracting_control/DAVIS/JPEGImages/480p",
                 task_kwargs={"random": seed},
-                
             )
         else:
             assert task is None

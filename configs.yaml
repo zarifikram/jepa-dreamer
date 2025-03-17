@@ -20,7 +20,7 @@ defaults:
   video_pred_log: True
   use_pixel_shift: False
   pixel_shift_prob: 0.2
-  wandb_enabled: False
+  wandb_enabled: True
   wandb_exp: "default-exp"
   wandb_proj: "default-proj"
 
@@ -233,6 +233,9 @@ updates:
 # steve: object centric representation
   use_ocr: False
 
+# delulu
+  use_evaluator: False
+
 mlr:
   use_mlr_loss: True
  
@@ -259,6 +262,17 @@ steve:
   use_ocr: True
   steve_dict: 
     {num_iterations: 2, num_slots: 15, cnn_hidden_size: 64, slot_size: 192, mlp_hidden_size: 192, img_channels: 3, image_size: 64, vocab_size: 4096, d_model: 192, num_predictor_blocks: 1, num_predictor_heads: 4, predictor_dropout: 0.0, num_decoder_blocks: 8, num_decoder_heads: 4, dropout: 0.1}
+
+delusion:
+  use_evaluator: True
+  evaluator_config: {
+    'local_arch': 'a',
+    'discount_config': {"n_bins": 16, "gamma":0.99, "arch": "b",},  
+    'histogram_config': {"n_bins": 16, "value_max": 16, "value_min": 1,},
+    }
+
+
+
 
 
 

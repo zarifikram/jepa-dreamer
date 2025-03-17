@@ -313,6 +313,7 @@ class MultiEncoder(nn.Module):
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
+        self.device = device
         shapes = {
             k: v
             for k, v in shapes.items()

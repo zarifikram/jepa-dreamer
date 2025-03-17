@@ -12,6 +12,7 @@ from x_transformers import Encoder, Decoder
 from typing import List, Tuple, Set
 from kornia.augmentation import RandomCrop
 from utils import ContrastModel, random_shift
+from delusion.losses import FeasibilityEvaluator
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -46,6 +47,7 @@ class WorldModel(nn.Module):
         config.encoder["use_atc_loss"] = config.use_atc_loss
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
+        self.obs_space, self.act_space = obs_space, act_space
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
             config.dyn_deter,
@@ -64,70 +66,15 @@ class WorldModel(nn.Module):
             config.device,
         )
 
-        self.use_pixel_shift = config.use_pixel_shift
-        if self.use_pixel_shift:
-            self.pixel_shift_prob = config.pixel_shift_prob
-            print(f"pixel shift prob {self.pixel_shift_prob}")
-
+        self._get_extra_losses(config)
+        
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
-
-        self._use_mlr_loss = config.use_mlr_loss
-        if self._use_mlr_loss:
-            print(f"obs space[image] shape: {obs_space['image'].shape}")
-            self.transformation = [nn.Sequential(nn.ReplicationPad2d(4), RandomCrop((64, 64))), Intensity(scale=0.05)]
-            image_size = obs_space["image"].shape[0] #if "image" in obs_space else obs_space["stoch"].shape[0]
-            self.masker = networks.CubeMaskGenerator(
-            input_size=image_size // config.patch_size, image_size=image_size, clip_size=config.batch_length, \
-                block_size=config.batch_length // config.patch_size, mask_ratio=config.mask_ratio) 
-            self.transformer = Encoder(
-                dim=self.embed_size,
-                heads=1,
-                depth=2,
-                layer_dropout=0.0,
-            ).to(config.device)
-            print(f"act_space action shape {act_space.shape}")
-            self.action_embedding = nn.Linear(np.prod(act_space.shape), self.embed_size).to(config.device)
-            self.position = PositionalEmbedding(self.embed_size)
-            self.byol_loss = networks.SPRPred(input_size = self.embed_size, output_size = 256).to(config.device)
-
-        self._use_atc_loss = config.use_atc_loss
-        self.atc_K = config.atc_K
-        if self._use_atc_loss:
-            self.encoder.set_tau(config.atc_tau)
-
-
-        self._use_acro_loss = config.use_acro_loss
-        if self._use_acro_loss:
-            self.acro_K = config.acro_K
-            self.bc_predictor = BehaviorCloneActionHead(
-                feat_size,   
-                act_space.shape,
-                config.actor_layers,
-                config.units,
-                config.acro_K,
-                config.use_bottleneck,
-                config.bottleneck_params,
-                config.use_count_based_exploration,
-                config.act,
-                config.acro_norm,
-                config.actor_dist,
-                unimix_ratio=config.action_unimix_ratio,
-                device=config.device,
-            )
-
-        self._use_icm_loss = config.use_icm_loss
-        if self._use_icm_loss:
-            self.icm = ICMModel(
-                feat_size,
-                act_space.shape,
-                config.actor_dist,
-                config.device,
-                config,
-            )
+        
+        self.feat_size = feat_size
             
         self.heads["decoder"] = networks.MultiDecoder(
             feat_size, shapes, **config.decoder
@@ -195,7 +142,6 @@ class WorldModel(nn.Module):
         # reward (batch_size, batch_length)
         # discount (batch_size, batch_length)
         data = self.preprocess(data)
-
         with tools.RequiresGrad(self):
             with torch.amp.autocast("cuda", enabled=self._use_amp):
                 _mets = {}
@@ -223,8 +169,13 @@ class WorldModel(nn.Module):
                 else:
                     embed = self.encoder(data)
 
+                data.update({"embed": embed})
+
                 if self._use_atc_loss:
                     _mets.update(self.encoder.calculate_atc_loss(data["image"], K=self.atc_K))
+
+                if self._use_evaluator:
+                    _mets.update(self.evaluator.calculate_multihead_error(data))
                 
                 # embed = self.encoder(data)
                 post, prior = self.dynamics.observe(
@@ -244,7 +195,6 @@ class WorldModel(nn.Module):
                         feat[:, :-1], feat[:, 1:], data['action'][:, :-1]
                     ))
                 
-
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
                 rep_scale = self._config.rep_scale
@@ -323,7 +273,7 @@ class WorldModel(nn.Module):
     def preprocess(self, obs):
         obs = obs.copy()
         obs["image"] = torch.Tensor(obs["image"]) / 255.0
-        if self.use_pixel_shift:
+        if self._use_pixel_shift:
             obs["image"] = self.random_pixel_shift(obs["image"], self.pixel_shift_prob)
         if "discount" in obs:
             obs["discount"] *= self._config.discount
@@ -359,6 +309,75 @@ class WorldModel(nn.Module):
         error = (model - truth + 1.0) / 2.0
 
         return torch.cat([truth, model, error], 2)
+    
+    def _get_extra_losses(self, config):
+        self._use_evaluator = config.use_evaluator
+        if self._use_evaluator:
+            self.evaluator = FeasibilityEvaluator(config.evaluator_config, self.encoder, self.act_space)
+
+
+        ### Pixel shift for testing robustness
+        self._use_pixel_shift = config.use_pixel_shift
+        if self._use_pixel_shift:
+            self.pixel_shift_prob = config.pixel_shift_prob
+            print(f"pixel shift prob {self.pixel_shift_prob}")
+
+        ### MLR Loss
+        self._use_mlr_loss = config.use_mlr_loss
+        if self._use_mlr_loss:
+            self.transformation = [nn.Sequential(nn.ReplicationPad2d(4), RandomCrop((64, 64))), Intensity(scale=0.05)]
+            image_size = self.obs_space["image"].shape[0] #if "image" in obs_space else obs_space["stoch"].shape[0]
+            self.masker = networks.CubeMaskGenerator(
+            input_size=image_size // config.patch_size, image_size=image_size, clip_size=config.batch_length, \
+                block_size=config.batch_length // config.patch_size, mask_ratio=config.mask_ratio) 
+            self.transformer = Encoder(
+                dim=self.embed_size,
+                heads=1,
+                depth=2,
+                layer_dropout=0.0,
+            ).to(config.device)
+            self.action_embedding = nn.Linear(np.prod(self.act_space.shape), self.embed_size).to(config.device)
+            self.position = PositionalEmbedding(self.embed_size)
+            self.byol_loss = networks.SPRPred(input_size = self.embed_size, output_size = 256).to(config.device)
+
+        ### ATC Loss
+        self._use_atc_loss = config.use_atc_loss
+        self.atc_K = config.atc_K
+        if self._use_atc_loss:
+            self.encoder.set_tau(config.atc_tau)
+
+
+        ### ACRO Loss
+        self._use_acro_loss = config.use_acro_loss
+        if self._use_acro_loss:
+            self.acro_K = config.acro_K
+            self.bc_predictor = BehaviorCloneActionHead(
+                self.feat_size,   
+                self.act_space.shape,
+                config.actor_layers,
+                config.units,
+                config.acro_K,
+                config.use_bottleneck,
+                config.bottleneck_params,
+                config.use_count_based_exploration,
+                config.act,
+                config.acro_norm,
+                config.actor_dist,
+                unimix_ratio=config.action_unimix_ratio,
+                device=config.device,
+            )
+
+        ### ICM Loss
+        self._use_icm_loss = config.use_icm_loss
+        if self._use_icm_loss:
+            self.icm = ICMModel(
+                self.feat_size,
+                self.act_space.shape,
+                config.actor_dist,
+                config.device,
+                config,
+            )
+
 
 
 class ImagBehavior(nn.Module):
