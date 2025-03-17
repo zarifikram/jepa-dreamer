@@ -13,6 +13,12 @@ perception_archs = {
         ("linear", 128, 128),
         ("linear", 128, 64),
     ],
+    "c": [
+        ("linear", 1536, 512),
+        ("linear", 512, 256),
+        ("linear", 256, 256),
+        ("linear", 256, 128),
+    ],
 }
 
 
@@ -46,6 +52,7 @@ class FeasibilityEvaluator(torch.nn.Module):
         self.config = evaluator_config
         self.encoder = encoder
         self.action_space = action_space
+        self.rejection_tau = self.config["rejection_tau"]
         self.local_feature_extrator = LocalPerception(evaluator_config)
         self.discount_predictor = DiscountValue(
             evaluator_config["discount_config"], action_space.shape, encoder.device
@@ -105,7 +112,6 @@ class FeasibilityEvaluator(torch.nn.Module):
             target_distance.detach(),
             reduction="none",
         ).sum(-1)
-        print(loss_discount.sum())
         return {"evaluator_loss": loss_discount.sum()}
 
     def _calculate_binned_target_distance(
@@ -188,14 +194,45 @@ class FeasibilityEvaluator(torch.nn.Module):
         ].reshape(-1, *rest_of_dims)
 
     def _get_goal_obs_and_latent(self, data):
-        # TODO: Update it
+        """Selects random goal observations and latent states.
+
+        This method selects random observations and latent states from the next batch
+        to be used as targets/goals.
+
+        Args:
+            data: A dictionary containing batched data.
+
+        Returns:
+            A tuple containing the target observations and latent states.
+        """
         batch_obs_curr, batch_obs_next = self._get_batched_current_and_next(
             data["image"]
         )
         batch_state_curr, batch_state_next = self._get_batched_current_and_next(
             data["embed"]
         )
-        return batch_obs_next, batch_state_next
+        B = batch_obs_next.shape[0]
+        # we want B random indices to choose from batch_state_next
+        random_indices = torch.randint(0, B, (B,))
+        batch_obs_targ, batch_state_targ = (
+            batch_obs_next[random_indices],
+            batch_state_next[random_indices],
+        )
+        return batch_obs_targ, batch_state_targ
+
+    @torch.no_grad()
+    def calculate_rejection_mask_from_generated_outputs(
+        self, context_feats, generated_feats
+    ):
+        local_state, generated_local_state = self.local_feature_extrator(
+            context_feats
+        ), self.local_feature_extrator(generated_feats)
+        predicted_discount = (
+            self.discount_predictor(local_state, generated_local_state)
+            .softmax(-1)
+            .max(-2)[0]
+        )
+        return predicted_discount[:, 0] < self.rejection_tau
 
 
 class LocalPerception(torch.nn.Module):
@@ -211,9 +248,11 @@ class LocalPerception(torch.nn.Module):
         )
 
     def forward(self, state):
-        x = state.reshape(-1, *self.conv_shape)
-        x = self.layers["conv"](x)
-        x = x.view(x.size(0), -1)
+        x = state
+        if len(self.layers["conv"]) > 0:
+            x = x.reshape(-1, *self.conv_shape)
+            x = self.layers["conv"](x)
+            x = x.view(x.size(0), -1)
         x = self.layers["mlp"](x)
         return x
 

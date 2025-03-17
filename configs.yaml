@@ -22,7 +22,7 @@ defaults:
   pixel_shift_prob: 0.2
   wandb_enabled: True
   wandb_exp: "default-exp"
-  wandb_proj: "default-proj"
+  wandb_proj: "dreamer_delulu"
 
   # Environment
   task: 'dmc_walker_walk'
@@ -266,7 +266,8 @@ steve:
 delusion:
   use_evaluator: True
   evaluator_config: {
-    'local_arch': 'a',
+    'rejection_tau': 0.25,
+    'local_arch': 'c',
     'discount_config': {"n_bins": 16, "gamma":0.99, "arch": "b",},  
     'histogram_config': {"n_bins": 16, "value_max": 16, "value_min": 1,},
     }
