@@ -8,15 +8,15 @@
 #SBATCH --gpus 1 
 #SBATCH --mem=16G                                        # Ask for 10 GB of RAM
 
-module load python/3.9
+# module load python/3.9
 
-source $HOME/scratch/dmr/bin/activate
+# source $HOME/scratch/dmr/bin/activate
 
-mkdir logdir
+# mkdir logdir
 
 game_name=$1
 seed=$2
 exp_name=ddmc_${game_name}_dv3_${seed}
-proj_name=ddmc
+proj_name=ddmc_last_try
 type=dv3
-nohup python dreamer.py --task=ddmc_${game_name} --wandb_proj ${proj_name} --wandb_exp ${exp_name} --configs dmc_vision debug updates --logdir ./logdir/${exp_name} &> ./logdir/${exp_name}.log 2> ./logdir/${exp_name}.err
+nohup python dreamer.py --task=ddmc_${game_name} --seed ${seed} --wandb_proj ${proj_name} --wandb_exp ${exp_name} --configs dmc_vision updates --logdir /data/zikram/dreamer/${exp_name} &> ./logdir/${exp_name}.log 2> ./logdir/${exp_name}.err

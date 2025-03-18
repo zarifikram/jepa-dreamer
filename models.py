@@ -12,6 +12,7 @@ from x_transformers import Encoder, Decoder
 from typing import List, Tuple, Set
 from kornia.augmentation import RandomCrop
 from utils import ContrastModel, random_shift
+from delusion.losses import FeasibilityEvaluator
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -46,6 +47,7 @@ class WorldModel(nn.Module):
         config.encoder["use_atc_loss"] = config.use_atc_loss
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
+        self.obs_space, self.act_space = obs_space, act_space
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
             config.dyn_deter,
@@ -64,10 +66,7 @@ class WorldModel(nn.Module):
             config.device,
         )
 
-        self.use_pixel_shift = config.use_pixel_shift
-        if self.use_pixel_shift:
-            self.pixel_shift_prob = config.pixel_shift_prob
-            print(f"pixel shift prob {self.pixel_shift_prob}")
+        self._get_extra_losses(config)
 
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
@@ -75,60 +74,8 @@ class WorldModel(nn.Module):
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
 
-        self._use_mlr_loss = config.use_mlr_loss
-        if self._use_mlr_loss:
-            print(f"obs space[image] shape: {obs_space['image'].shape}")
-            self.transformation = [nn.Sequential(nn.ReplicationPad2d(4), RandomCrop((64, 64))), Intensity(scale=0.05)]
-            image_size = obs_space["image"].shape[0] #if "image" in obs_space else obs_space["stoch"].shape[0]
-            self.masker = networks.CubeMaskGenerator(
-            input_size=image_size // config.patch_size, image_size=image_size, clip_size=config.batch_length, \
-                block_size=config.batch_length // config.patch_size, mask_ratio=config.mask_ratio) 
-            self.transformer = Encoder(
-                dim=self.embed_size,
-                heads=1,
-                depth=2,
-                layer_dropout=0.0,
-            ).to(config.device)
-            print(f"act_space action shape {act_space.shape}")
-            self.action_embedding = nn.Linear(np.prod(act_space.shape), self.embed_size).to(config.device)
-            self.position = PositionalEmbedding(self.embed_size)
-            self.byol_loss = networks.SPRPred(input_size = self.embed_size, output_size = 256).to(config.device)
+        self.feat_size = feat_size
 
-        self._use_atc_loss = config.use_atc_loss
-        self.atc_K = config.atc_K
-        if self._use_atc_loss:
-            self.encoder.set_tau(config.atp_tau)
-
-
-        self._use_acro_loss = config.use_acro_loss
-        if self._use_acro_loss:
-            self.acro_K = config.acro_K
-            self.bc_predictor = BehaviorCloneActionHead(
-                feat_size,   
-                act_space.shape,
-                config.actor_layers,
-                config.units,
-                config.acro_K,
-                config.use_bottleneck,
-                config.bottleneck_params,
-                config.use_count_based_exploration,
-                config.act,
-                config.acro_norm,
-                config.actor_dist,
-                unimix_ratio=config.action_unimix_ratio,
-                device=config.device,
-            )
-
-        self._use_icm_loss = config.use_icm_loss
-        if self._use_icm_loss:
-            self.icm = ICMModel(
-                feat_size,
-                act_space.shape,
-                config.actor_dist,
-                config.device,
-                config,
-            )
-            
         self.heads["decoder"] = networks.MultiDecoder(
             feat_size, shapes, **config.decoder
         )
@@ -176,7 +123,7 @@ class WorldModel(nn.Module):
             reward=config.reward_head["loss_scale"],
             cont=config.cont_head["loss_scale"],
         )
-    
+
     def random_pixel_shift(self, frames, shift_prob):
         # Generate a mask where each pixel is marked to be shifted or not based on probability
         mask = torch.rand(frames.shape) < shift_prob
@@ -195,7 +142,6 @@ class WorldModel(nn.Module):
         # reward (batch_size, batch_length)
         # discount (batch_size, batch_length)
         data = self.preprocess(data)
-
         with tools.RequiresGrad(self):
             with torch.amp.autocast("cuda", enabled=self._use_amp):
                 _mets = {}
@@ -206,9 +152,19 @@ class WorldModel(nn.Module):
                     B, T = data["image"].shape[:2]
                     mask = mask.expand(B, -1, -1, -1, -1)
                     images = self.apply_transformation(data["image"])
-                    masked_obs = images * mask if "image" in data else data["stoch"] * mask
-                    masked_data = {"image": masked_obs} if "image" in data else {"stoch": masked_obs, "deter": data["deter"]}
-                    masked_latent, non_masked_latent = self.encoder.calculate_masked_non_masked_embeddings(masked_data, data)
+                    masked_obs = (
+                        images * mask if "image" in data else data["stoch"] * mask
+                    )
+                    masked_data = (
+                        {"image": masked_obs}
+                        if "image" in data
+                        else {"stoch": masked_obs, "deter": data["deter"]}
+                    )
+                    masked_latent, non_masked_latent = (
+                        self.encoder.calculate_masked_non_masked_embeddings(
+                            masked_data, data
+                        )
+                    )
                     position = self.position(T)
                     position = position.expand(B, T, -1)
                     masked_latent = masked_latent + position
@@ -218,32 +174,41 @@ class WorldModel(nn.Module):
                     x_full = torch.cat([masked_latent, action_embed_change], 1)
                     x_full = self.transformer(x_full)
                     masked_latent = x_full[:, :T]
-                    _mets.update(self.byol_loss.calculate_byol_loss(masked_latent, non_masked_latent))
+                    _mets.update(
+                        self.byol_loss.calculate_byol_loss(
+                            masked_latent, non_masked_latent
+                        )
+                    )
                     embed = non_masked_latent
                 else:
                     embed = self.encoder(data)
 
                 if self._use_atc_loss:
-                    _mets.update(self.encoder.calculate_atc_loss(data["image"], K=self.atc_K))
-                
+                    _mets.update(
+                        self.encoder.calculate_atc_loss(data["image"], K=self.atc_K)
+                    )
+
                 # embed = self.encoder(data)
                 post, prior = self.dynamics.observe(
                     embed, data["action"], data["is_first"]
                 )
 
                 feat = self.dynamics.get_feat(post)
-                
+
+                data.update({"embed": feat})
+                if self._use_evaluator:
+                    _mets.update(self.evaluator.calculate_multihead_error(data))
+
                 if self._use_acro_loss:
                     # TODO: what about prior
-                    _mets.update(self.bc_predictor.calculate_loss(
-                        feat, data["action"]
-                    ))
-                
+                    _mets.update(self.bc_predictor.calculate_loss(feat, data["action"]))
+
                 if self._use_icm_loss:
-                    _mets.update(self.icm.calculate_loss(
-                        feat[:, :-1], feat[:, 1:], data['action'][:, :-1]
-                    ))
-                
+                    _mets.update(
+                        self.icm.calculate_loss(
+                            feat[:, :-1], feat[:, 1:], data["action"][:, :-1]
+                        )
+                    )
 
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
@@ -272,7 +237,12 @@ class WorldModel(nn.Module):
                     for key, value in losses.items()
                 }
                 model_loss = sum(scaled.values()) + kl_loss
-                if self._use_acro_loss or self._use_icm_loss or self._use_mlr_loss or self._use_atc_loss:
+                if (
+                    self._use_acro_loss
+                    or self._use_icm_loss
+                    or self._use_mlr_loss
+                    or self._use_atc_loss
+                ):
                     for v in _mets.values():
                         model_loss += v
             metrics = self._model_opt(torch.mean(model_loss), self.parameters())
@@ -284,9 +254,14 @@ class WorldModel(nn.Module):
         metrics["dyn_loss"] = to_np(dyn_loss)
         metrics["rep_loss"] = to_np(rep_loss)
         metrics["kl"] = to_np(torch.mean(kl_value))
-        if self._use_acro_loss or self._use_icm_loss or self._use_mlr_loss or self._use_atc_loss:
-                for k, v in _mets.items():
-                    metrics[k] = to_np(v)
+        if (
+            self._use_acro_loss
+            or self._use_icm_loss
+            or self._use_mlr_loss
+            or self._use_atc_loss
+        ):
+            for k, v in _mets.items():
+                metrics[k] = to_np(v)
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(
                 torch.mean(self.dynamics.get_dist(prior).entropy())
@@ -315,15 +290,16 @@ class WorldModel(nn.Module):
         images = rearrange(images, "B H W C -> B C H W")
         for t in self.transformation:
             images = t(images)
-        
+
         images = rearrange(images, "B C H W -> B H W C")
         images = images.reshape(*img_shape)
         return images
+
     # this function is called during both rollout and training
     def preprocess(self, obs):
         obs = obs.copy()
         obs["image"] = torch.Tensor(obs["image"]) / 255.0
-        if self.use_pixel_shift:
+        if self._use_pixel_shift:
             obs["image"] = self.random_pixel_shift(obs["image"], self.pixel_shift_prob)
         if "discount" in obs:
             obs["discount"] *= self._config.discount
@@ -359,6 +335,87 @@ class WorldModel(nn.Module):
         error = (model - truth + 1.0) / 2.0
 
         return torch.cat([truth, model, error], 2)
+
+    def _get_extra_losses(self, config):
+        self._use_evaluator = config.use_evaluator
+        if self._use_evaluator:
+            self.evaluator = FeasibilityEvaluator(
+                config.evaluator_config, self.encoder, self.act_space
+            )
+
+        ### Pixel shift for testing robustness
+        self._use_pixel_shift = config.use_pixel_shift
+        if self._use_pixel_shift:
+            self.pixel_shift_prob = config.pixel_shift_prob
+            print(f"pixel shift prob {self.pixel_shift_prob}")
+
+        ### MLR Loss
+        self._use_mlr_loss = config.use_mlr_loss
+        if self._use_mlr_loss:
+            self.transformation = [
+                nn.Sequential(nn.ReplicationPad2d(4), RandomCrop((64, 64))),
+                Intensity(scale=0.05),
+            ]
+            image_size = self.obs_space["image"].shape[
+                0
+            ]  # if "image" in obs_space else obs_space["stoch"].shape[0]
+            self.masker = networks.CubeMaskGenerator(
+                input_size=image_size // config.patch_size,
+                image_size=image_size,
+                clip_size=config.batch_length,
+                block_size=config.batch_length // config.patch_size,
+                mask_ratio=config.mask_ratio,
+            )
+            self.transformer = Encoder(
+                dim=self.embed_size,
+                heads=1,
+                depth=2,
+                layer_dropout=0.0,
+            ).to(config.device)
+            self.action_embedding = nn.Linear(
+                np.prod(self.act_space.shape), self.embed_size
+            ).to(config.device)
+            self.position = PositionalEmbedding(self.embed_size)
+            self.byol_loss = networks.SPRPred(
+                input_size=self.embed_size, output_size=256
+            ).to(config.device)
+
+        ### ATC Loss
+        self._use_atc_loss = config.use_atc_loss
+        self.atc_K = config.atc_K
+        if self._use_atc_loss:
+            self.encoder.set_tau(config.atc_tau)
+
+        ### ACRO Loss
+        self._use_acro_loss = config.use_acro_loss
+        if self._use_acro_loss:
+            self.acro_K = config.acro_K
+            self.bc_predictor = BehaviorCloneActionHead(
+                self.feat_size,
+                self.act_space.shape,
+                config.actor_layers,
+                config.units,
+                config.acro_K,
+                config.use_bottleneck,
+                config.bottleneck_params,
+                config.use_count_based_exploration,
+                config.act,
+                config.acro_norm,
+                config.actor_dist,
+                unimix_ratio=config.action_unimix_ratio,
+                device=config.device,
+            )
+
+        ### ICM Loss
+        self._use_icm_loss = config.use_icm_loss
+        if self._use_icm_loss:
+            self.icm = ICMModel(
+                self.feat_size,
+                self.act_space.shape,
+                config.actor_dist,
+                config.device,
+                config,
+            )
 
 
 class ImagBehavior(nn.Module):
@@ -473,7 +530,12 @@ class ImagBehavior(nn.Module):
                 if self._config.critic["slow_target"]:
                     value_loss -= value.log_prob(slow_target.mode().detach())
                 # (time, batch, 1), (time, batch, 1) -> (1,)
-                value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
+                value_loss = weights[:-1] * value_loss[:, :, None]
+                
+                if self._config.use_evaluator:
+                    rejection_mask = self._get_rejection_mask_from_evaluator(imag_feat)
+                    value_loss[rejection_mask] = 0.0
+                value_loss = torch.mean(value_loss)
 
         metrics.update(tools.tensorstats(value.mode(), "value"))
         metrics.update(tools.tensorstats(target, "target"))
@@ -491,6 +553,31 @@ class ImagBehavior(nn.Module):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
         return imag_feat, imag_state, imag_action, weights, metrics
+
+    def _get_rejection_mask_from_evaluator(self, imag_feat):
+        """Calculates a rejection mask based on evaluator's output.
+
+        This method reshapes the input features, computes a rejection mask using the evaluator,
+        and then reshapes the mask back to its original form.
+
+        Args:
+            imag_feat: Imagined features.
+
+        Returns:
+            Rejection mask.
+        """
+        imag_t, imag_t_plus_1 = imag_feat[:-1], imag_feat[1:]
+        T, B, _ = imag_t.shape
+        imag_t, imag_t_plus_1 = imag_t.reshape(T * B, -1), imag_t_plus_1.reshape(
+            T * B, -1
+        )
+        rejection_mask = (
+            self._world_model.evaluator.calculate_rejection_mask_from_generated_outputs(
+                imag_t, imag_t_plus_1
+            )
+        )
+        rejection_mask = rejection_mask.reshape(T, B, -1)
+        return rejection_mask
 
     def _imagine(self, start, policy, horizon):
         dynamics = self._world_model.dynamics
@@ -582,6 +669,7 @@ class ImagBehavior(nn.Module):
                     d.data = mix * s.data + (1 - mix) * d.data
             self._updates += 1
 
+
 class ICMModel(nn.Module):
     def __init__(
         self,
@@ -590,7 +678,7 @@ class ICMModel(nn.Module):
         dist: str,
         device: str,
         config,
-        unimix_ratio: float=0.01,
+        unimix_ratio: float = 0.01,
     ):
         super(ICMModel, self).__init__()
 
@@ -627,9 +715,10 @@ class ICMModel(nn.Module):
             if isinstance(p, nn.Linear):
                 torch.nn.init.kaiming_uniform_(p.weight, a=1.0)
                 p.bias.data.zero_()
-        
-        print(f"Total number of parameters for ICM in Megabytes is: {sum(p.numel() for p in self.parameters()) * 4 / 1024 / 1024}")
 
+        print(
+            f"Total number of parameters for ICM in Megabytes is: {sum(p.numel() for p in self.parameters()) * 4 / 1024 / 1024}"
+        )
 
     def forward(self, inputs: list) -> tuple:
         state, next_state, action = inputs
@@ -642,7 +731,9 @@ class ICMModel(nn.Module):
         if self._dist == "onehot":
             pred_action = tools.OneHotDist(pred_action, unimix_ratio=self._unimix_ratio)
         elif self._dist == "onehot_categorical":
-            pred_action = pred_action.reshape(list(pred_action.shape[:-1]) + list(self._action_shape))
+            pred_action = pred_action.reshape(
+                list(pred_action.shape[:-1]) + list(self._action_shape)
+            )
             pred_action = tools.FlattenDist(
                 tools.OneHotDist(pred_action, unimix_ratio=self._unimix_ratio)
             )
@@ -786,8 +877,9 @@ class BehaviorCloneActionHead(nn.Module):
                 )  # too big, can't fit in GPU
                 self._queue_ptr = 0
 
-        print(f"Total number of parameters for ACRO in Megabytes is: {sum(p.numel() for p in self.parameters()) * 4 / 1024 / 1024}")
-
+        print(
+            f"Total number of parameters for ACRO in Megabytes is: {sum(p.numel() for p in self.parameters()) * 4 / 1024 / 1024}"
+        )
 
     def forward(self, features, dtype=None):
         x_t = features[:, : -self.K, :]
@@ -922,12 +1014,19 @@ class GRUCell(nn.Module):
         output = update * cand + (1 - update) * state
         return output, [output]
 
+
 @jit.script
-def get_target_patches(patch_h: int, patch_w: int, block_h:int, block_w: int, M: int)->torch.Tensor:
+def get_target_patches(
+    patch_h: int, patch_w: int, block_h: int, block_w: int, M: int
+) -> torch.Tensor:
     start_patches_h = torch.randint(0, patch_h - block_h + 1, (M,))
     start_patches_w = torch.randint(0, patch_w - block_w + 1, (M,))
     start_patches = start_patches_h * patch_w + start_patches_w
-    target_patches = torch.arange(block_h).repeat_interleave(block_w) * patch_w + torch.arange(block_w).repeat(block_h) + start_patches[:, None]
+    target_patches = (
+        torch.arange(block_h).repeat_interleave(block_w) * patch_w
+        + torch.arange(block_w).repeat(block_h)
+        + start_patches[:, None]
+    )
     return target_patches
 
 
@@ -954,7 +1053,7 @@ class IJEPA(nn.Module):
         device: str,
     ):
         super().__init__()
- 
+
         self.inp_dim = inp_dim
         self.proj_dim = proj_dim
         self.n_patches = n_patches
@@ -972,8 +1071,6 @@ class IJEPA(nn.Module):
         self.m = m
         self.m_start_end = m_start_end
         self._should_patch = should_patch
-        
-
 
         self._device = device
         self.pos_embedding = nn.Embedding(n_patches, embed_dim).to(device)
@@ -997,7 +1094,9 @@ class IJEPA(nn.Module):
         )  # inp_dim -> proj_dim -> (n_patches, proj_dim / n_patches)
         self.predictor = Predictor(embed_dim, enc_heads, decoder_depth)
         # total params
-        print(f"Total number of parameters for IJEPA in Megabytes is: {sum(p.numel() for p in self.parameters()) * 4 / 1024 / 1024}")
+        print(
+            f"Total number of parameters for IJEPA in Megabytes is: {sum(p.numel() for p in self.parameters()) * 4 / 1024 / 1024}"
+        )
 
     # @jit.script
     @torch.no_grad()
@@ -1048,9 +1147,7 @@ class IJEPA(nn.Module):
         all_patches = target_patches.reshape(-1).unique().tolist()
 
         return target_block, target_patches, all_patches
-    
-    
-        
+
     # @jit.script
     def get_context_block(
         self,
@@ -1116,7 +1213,11 @@ class IJEPA(nn.Module):
         context_scale: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # get the patch embeddings
-        x = self._convert_embed_to_patches(x) if self._should_patch else self._project_embed(x)
+        x = (
+            self._convert_embed_to_patches(x)
+            if self._should_patch
+            else self._project_embed(x)
+        )
         # add the positional embeddings
         x = x + self.pos_embedding.weight
         # normalize the embeddings
@@ -1148,34 +1249,45 @@ class IJEPA(nn.Module):
         target_masks = self.mask_token.repeat(m, b, n, 1)
         target_pos_embedding = self.pos_embedding.weight[target_patches, :].unsqueeze(1)
         target_masks = target_masks + target_pos_embedding
-        prediction_blocks = self.predictor(context_encoding.repeat(m, 1, 1, 1), target_masks)
+        prediction_blocks = self.predictor(
+            context_encoding.repeat(m, 1, 1, 1), target_masks
+        )
 
         return prediction_blocks, target_blocks
 
     def calculate_loss(self, embed: torch.Tensor) -> dict:
-        #generate random target and context aspect ratio and scale
-        target_aspect_ratio = np.random.uniform(self.target_aspect_ratio[0], self.target_aspect_ratio[1])
+        # generate random target and context aspect ratio and scale
+        target_aspect_ratio = np.random.uniform(
+            self.target_aspect_ratio[0], self.target_aspect_ratio[1]
+        )
         target_scale = np.random.uniform(self.target_scale[0], self.target_scale[1])
         context_aspect_ratio = self.context_aspect_ratio
         context_scale = np.random.uniform(self.context_scale[0], self.context_scale[1])
-        
-        prediction_blocks, target_blocks = self.compute_prediction_and_target(embed, target_aspect_ratio, target_scale, context_aspect_ratio, context_scale)
+
+        prediction_blocks, target_blocks = self.compute_prediction_and_target(
+            embed,
+            target_aspect_ratio,
+            target_scale,
+            context_aspect_ratio,
+            context_scale,
+        )
         loss = nn.MSELoss()(prediction_blocks, target_blocks)
         return {"IJEPA_loss": loss} if self._should_patch else {"TJEPA_loss": loss}
-
 
     def on_after_backward(self):
         self.update_momentum(self.m)
         self.m += (self.m_start_end[1] - self.m_start_end[0]) / 1e6
-    
+
     def update_momentum(self, m):
         student_model = self.student_encoder.eval()
         teacher_model = self.teacher_encoder.eval()
         with torch.no_grad():
-            for student_param, teacher_param in zip(student_model.parameters(), teacher_model.parameters()):
-                teacher_param.data.mul_(other=m).add_(other=student_param.data, alpha=1 - m)
-
-        
+            for student_param, teacher_param in zip(
+                student_model.parameters(), teacher_model.parameters()
+            ):
+                teacher_param.data.mul_(other=m).add_(
+                    other=student_param.data, alpha=1 - m
+                )
 
 
 class Predictor(nn.Module):
@@ -1199,7 +1311,9 @@ class Predictor(nn.Module):
         x = self.predictor(x)
         # return last len(target_masks) tokens
         l = x.shape[-2]
-        return x[:, l - target_masks.shape[-2] :, :].reshape(m, b, target_masks.shape[-2], e)
+        return x[:, l - target_masks.shape[-2] :, :].reshape(
+            m, b, target_masks.shape[-2], e
+        )
 
 
 class PositionalEmbedding(nn.Module):
@@ -1212,16 +1326,19 @@ class PositionalEmbedding(nn.Module):
         pe.require_grad = False
 
         position = torch.arange(0, max_len).float().unsqueeze(1)
-        div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
+        div_term = (
+            torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)
+        ).exp()
 
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
 
         pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+        self.register_buffer("pe", pe)
 
     def forward(self, length):
         return self.pe[:, :length]
+
 
 class Intensity(nn.Module):
     def __init__(self, scale):
