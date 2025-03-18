@@ -108,6 +108,7 @@ class ContrastModel(torch.nn.Module):
             dtype=torch.long, device=anchor.device)
 
         logits, anchor, positive = self(anchor, positive)
+        breakpoint()
         ul_loss = self.c_e_loss(logits, labels)
         
         # anchor = anchor.view(B, T, -1)
