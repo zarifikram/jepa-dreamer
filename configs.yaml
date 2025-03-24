@@ -13,7 +13,7 @@ defaults:
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
-  device: 'cuda:7'
+  device: 'cuda:3'
   compile: True
   precision: 32
   debug: False
@@ -21,7 +21,7 @@ defaults:
   use_pixel_shift: False
   pixel_shift_prob: 0.2
   wandb_enabled: True
-  wandb_exp: "default-exp"
+  wandb_exp: "tau-0.05"
   wandb_proj: "dreamer_delulu"
 
   # Environment
@@ -236,6 +236,8 @@ updates:
 # delulu
   use_evaluator: False
 
+# gan discriminator
+  use_discriminator: False
 mlr:
   use_mlr_loss: True
  
@@ -266,11 +268,29 @@ steve:
 delusion:
   use_evaluator: True
   evaluator_config: {
-    'rejection_tau': 0.25,
+    'rejection_tau': 0.05,
+    'goal_reach_threshold': 1.0,
+    'is_latent_goal': True,
     'local_arch': 'c',
     'discount_config': {"n_bins": 16, "gamma":0.99, "arch": "b",},  
     'histogram_config': {"n_bins": 16, "value_max": 16, "value_min": 1,},
     }
+  sample_prob: {"episode": 0.5, "pertask": 0.25, "generate": 0.25}
+  rb_config: {"size": 500000,}
+  policy_adjust: False
+  value_scale: True
+
+discriminator:
+  use_discriminator: True
+  evaluator_config: {
+    'arch': 'f',
+    'assumed_height': 40,
+    }
+  sample_prob: {"episode": 0.0, "pertask": 0.0, "generate": 1.0}
+  rb_config: {"size": 500000,}
+  value_scale: False
+  policy_adjust: True
+
 
 
 

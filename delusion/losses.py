@@ -1,42 +1,71 @@
 import torch
 
-
 perception_archs = {
     "a": [
-        ("conv", 256, 128),
-        ("conv", 128, 64),
-        ("linear", 1024, 256),
-        ("linear", 256, 128),
+        ("conv", 256, 128, 3, 1, 1),
+        ("conv", 128, 64, 3, 1, 1),
+        ("linear", 1024, 256, -1, -1, -1),
+        ("linear", 256, 128, -1, -1, -1),
     ],
     "b": [
-        ("linear", 256, 128),
-        ("linear", 128, 128),
-        ("linear", 128, 64),
+        ("linear", 256, 128, -1, -1, -1),
+        ("linear", 128, 128, -1, -1, -1),
+        ("linear", 128, 64, -1, -1, -1),
     ],
     "c": [
-        ("linear", 1536, 512),
-        ("linear", 512, 256),
-        ("linear", 256, 256),
-        ("linear", 256, 128),
+        ("linear", 1536, 512, -1, -1, -1),
+        ("linear", 512, 256, -1, -1, -1),
+        ("linear", 256, 256, -1, -1, -1),
+        ("linear", 256, 128, -1, -1, -1),
+    ],
+    "d": [
+        ("conv", 2, 4, 5, 1, 1),  # 36
+        ("conv", 4, 8, 5, 1, 1),  # 32
+        ("conv", 8, 16, 6, 2, 1),  # 15
+        ("conv", 16, 32, 5, 4, 1),  #
+        ("linear", 512, 256, -1, -1, -1),
+        ("linear", 256, 64, -1, -1, -1),
+        ("linear", 64, 2, -1, -1, -1),
+    ],
+    "e": [
+        ("conv", 2, 4, 6, 2, 1),  # 19
+        ("conv", 4, 8, 5, 2, 1),  # 9
+        ("conv", 8, 16, 3, 2, 1),  # 5
+        ("linear", 400, 256, -1, -1, -1),
+        ("linear", 256, 64, -1, -1, -1),
+        ("linear", 64, 2, -1, -1, -1),
+    ],
+    "f": [
+        ("conv", 2, 32, 3, 1, 1), # 40
+        ("maxpool", -1, -1, 2, 2, 0), # 20
+        ("conv", 32, 32, 3, 1, 1), # 20
+        ("maxpool", -1, -1, 2, 2, 0), # 10
+        ("conv", 32, 32, 3, 1, 1), # 10
+        ("maxpool", -1, -1, 2, 2, 0), # 5
+        ("conv", 32, 32, 3, 1, 1), # 5
+        ("maxpool", -1, -1, 2, 2, 0), # 2
+        ("linear", 128, 2, -1, -1, -1),
     ],
 }
 
 
-def get_layers(arch, final_dim=None):
+def get_layers(arch, final_dim=None, act=torch.nn.ReLU):
     arch = perception_archs[arch]
     conv_layers, mlp_layers = [], []
-    for i, (type_layer, in_dim, out_dim) in enumerate(arch):
+    for i, (type_layer, in_dim, out_dim, kernel, stride, padding) in enumerate(arch):
         if type_layer == "conv":
             conv_layers.append(
-                torch.nn.Conv2d(in_dim, out_dim, 3, stride=1, padding=1)
+                torch.nn.Conv2d(in_dim, out_dim, kernel, stride, padding)
             )  # don't change width and height
         elif type_layer == "linear":
             if i == len(arch) - 1 and final_dim:
                 out_dim = final_dim
             mlp_layers.append(torch.nn.Linear(in_dim, out_dim))
+        elif type_layer == "maxpool":
+            conv_layers.append(torch.nn.MaxPool2d(kernel, stride, padding))
 
         if i < len(arch) - 1:
-            mlp_layers.append(torch.nn.ReLU())
+            mlp_layers.append(act())
 
     return torch.nn.ModuleDict(
         {
@@ -44,6 +73,109 @@ def get_layers(arch, final_dim=None):
             "mlp": torch.nn.Sequential(*mlp_layers),
         }
     )
+
+
+class ContrastiveEvaluator(torch.nn.Module):
+    # uses a GAN-like discrimator which is learnt through contrastive learning
+    def __init__(
+        self,
+        evaluator_config,
+    ):
+        super(ContrastiveEvaluator, self).__init__()
+        self.config = evaluator_config
+        self.assumed_height = evaluator_config["assumed_height"]
+        self.layers = get_layers(evaluator_config["arch"], act=torch.nn.LeakyReLU)
+        print(
+            f"total number of parameters in the model is {sum(p.numel() for p in self.parameters())}"
+        )
+
+    def calculate_multihead_error(self, data: dict):
+        base_feats, positive_feats, negative_feats = (
+            self._calculate_positive_and_negative_samples(data)
+        )
+        positive_scores, negative_scores = self(base_feats, positive_feats), self(
+            base_feats, negative_feats
+        )
+        # cross entropy loss
+        positive_loss = torch.nn.functional.cross_entropy(
+            positive_scores,
+            torch.ones(positive_scores.shape[0], device=positive_scores.device).long(),
+        )
+        negative_loss = torch.nn.functional.cross_entropy(
+            negative_scores,
+            torch.zeros(negative_scores.shape[0], device=negative_scores.device).long(),
+        )
+        return {"evaluator_loss": positive_loss + negative_loss}
+
+    def _calculate_positive_and_negative_samples(self, data):
+        base_feats = self._get_base_samples(data)
+        positive_feats = self._get_positive_samples(data)
+        negative_feats = self._get_negative_samples(data)
+        return base_feats.detach(), positive_feats.detach(), negative_feats.detach()
+
+    def _get_base_samples(self, data):
+        post_feats = data["embed"]
+        return post_feats[:, :-1].reshape(-1, post_feats.shape[-1])
+
+    def _get_positive_samples(self, data):
+        post_feats = data["embed"]
+        return post_feats[:, 1:].reshape(-1, post_feats.shape[-1])
+
+    def _get_negative_samples(self, data):
+        rand_number = torch.rand(1)
+        if rand_number < 1.0:
+            return data["goal_embed"]  # already reshaped
+        else:
+            return self._get_prior_negative_samples(data)
+
+    def _get_prior_negative_samples(self, data):
+        stoch, deter = data["prior"]["stoch"], data["prior"]["deter"]
+        B, T = deter.shape[:2]
+        prior_feat = torch.cat([stoch.reshape(B, T, -1), deter.reshape(B, T, -1)], -1)
+        indices = self._get_indices(B, T, prior_feat.device)
+        return prior_feat[
+            torch.arange(B, device=indices.device).repeat_interleave(T - 1),
+            indices.reshape(-1),
+        ]
+
+    def _get_indices(self, B, T, device):
+        indices = torch.arange(T, device=device).repeat(T - 1, 1)
+        remove_indices = torch.arange(1, T, device=device).unsqueeze(1)
+        # remove the remove_indices from the indices
+        indices = indices[indices != remove_indices].reshape(T - 1, -1)
+        # now pick one random index from each row and do this for B times
+        indices = indices[
+            torch.arange(T - 1, device=device).repeat(B),
+            torch.randint(0, T - 1, (B * (T - 1),), device=device),
+        ].reshape(B, -1)
+        return indices
+
+    def forward(self, base_feats, other_feats):
+        base_feats, other_feats = self._padding_transform(
+            base_feats
+        ), self._padding_transform(other_feats)
+        x = torch.cat([base_feats, other_feats], 1)
+        x = self.layers["conv"](x)
+        x = x.view(x.size(0), -1)
+        x = self.layers["mlp"](x)
+        return x
+
+    def _padding_transform(self, feats):
+        B, D = feats.shape
+        extra_to_add = self.assumed_height**2 - D
+        if extra_to_add > 0:
+            feats = torch.cat(
+                [feats, torch.zeros(B, extra_to_add, device=feats.device)], -1
+            )
+
+        return feats.reshape(B, 1, self.assumed_height, self.assumed_height)
+
+    @torch.no_grad()
+    def calculate_rejection_mask_and_distance_from_generated_outputs(
+        self, context_feats, generated_feats
+    ):
+        scores = self(context_feats, generated_feats).argmax(-1).bool()
+        return scores, None
 
 
 class FeasibilityEvaluator(torch.nn.Module):
@@ -60,6 +192,8 @@ class FeasibilityEvaluator(torch.nn.Module):
         self.histogram_converter = HistogramConverter(
             evaluator_config["histogram_config"]
         )
+        self.is_latent_goal = evaluator_config["is_latent_goal"]
+        self.goal_reached_threshold = evaluator_config["goal_reach_threshold"]
         self.histogram_converter.to(encoder.device)
 
     def forward(
@@ -79,16 +213,36 @@ class FeasibilityEvaluator(torch.nn.Module):
             batch_state_targ,
         ) = self._get_relevant_info(data)
 
-        size_batch = batch_obs_curr.shape[0]
+        assert self.is_latent_goal == True or batch_obs_targ is not None
+
+        size_batch = batch_state_curr.shape[0]
         state_local_curr, state_local_next, state_local_targ = (
             self.calculate_batched_local_state(
                 batch_state_curr, batch_state_next, batch_state_targ
             )
         )
 
-        batch_targ_reached = (
-            (batch_obs_next == batch_obs_targ).reshape(size_batch, -1).all(-1)
-        )
+        if self.goal_reached_threshold:
+            if self.is_latent_goal:
+                batch_targ_reached = (batch_state_next - batch_state_targ).pow(2).sum(
+                    (1)
+                ) < self.goal_reached_threshold
+            else:
+                batch_targ_reached = (batch_obs_next - batch_obs_targ).pow(2).sum(
+                    (1, 2, 3)
+                ) < self.goal_reached_threshold
+        else:
+            batch_targ_reached = (
+                (batch_obs_next == batch_obs_targ).reshape(size_batch, -1).all(-1)
+            )
+
+        # log the mse between the target and the next state
+        # with torch.no_grad():
+        #     err = ((batch_obs_next - batch_obs_targ) **2).sum((1,2,3))
+        #     print(f"for threhold of {1} the rate of success is {((err < 1).sum() / size_batch) * 100}%")
+        #     print(f"for threhold of {5} the rate of success is {((err < 5).sum() / size_batch) * 100}%")
+        #     print(f"for threhold of {10} the rate of success is {((err < 10).sum() / size_batch) * 100}%")
+        #     print()
 
         predicted_discount = self.discount_predictor(
             state_local_curr, state_local_targ, batch_action
@@ -96,7 +250,7 @@ class FeasibilityEvaluator(torch.nn.Module):
 
         with torch.no_grad():
             action_next = self._calculate_best_action_for_next_step(
-                state_local_next.detach(), state_local_targ.detach()
+                state_local_next, state_local_targ
             )
             target_distance = self._calculate_binned_target_distance(
                 state_local_curr,
@@ -128,8 +282,7 @@ class FeasibilityEvaluator(torch.nn.Module):
     def _get_target_distance(self, distance, batch_done, batch_targ_reached):
         distance[batch_done] = 1000.0
         distance[batch_targ_reached] = 0.0
-        target_distance = distance + 1  # next step is 1 step away
-        return target_distance
+        return distance + 1
 
     def _calculate_binned_distance(self, distance):
         return self.histogram_converter.to_histogram(distance)
@@ -154,14 +307,6 @@ class FeasibilityEvaluator(torch.nn.Module):
             batched_local, [size_batch, size_batch, size_batch], dim=0
         )
         return state_local_curr, state_local_next, state_local_targ
-
-    def calculate_loss(obs, actions, next_obs, dones, goals, encoder):
-        states, next_states, goal_states = self._get_latent_representations(
-            obs, next_obs, goals
-        )
-
-    def _get_latent_representations(self, obs, next_obs, goals):
-        encoder.eval()
 
     def _get_relevant_info(self, data):
         batch_obs_curr, batch_obs_next = self._get_batched_current_and_next(
@@ -205,6 +350,9 @@ class FeasibilityEvaluator(torch.nn.Module):
         Returns:
             A tuple containing the target observations and latent states.
         """
+        if self.is_latent_goal:
+            batch_state_targ = data["goal_embed"]
+            return None, batch_state_targ
         batch_obs_curr, batch_obs_next = self._get_batched_current_and_next(
             data["image"]
         )
@@ -221,7 +369,7 @@ class FeasibilityEvaluator(torch.nn.Module):
         return batch_obs_targ, batch_state_targ
 
     @torch.no_grad()
-    def calculate_rejection_mask_from_generated_outputs(
+    def calculate_rejection_mask_and_distance_from_generated_outputs(
         self, context_feats, generated_feats
     ):
         local_state, generated_local_state = self.local_feature_extrator(
@@ -232,7 +380,7 @@ class FeasibilityEvaluator(torch.nn.Module):
             .softmax(-1)
             .max(-2)[0]
         )
-        return predicted_discount[:, 0] < self.rejection_tau
+        return predicted_discount[:, 0] < self.rejection_tau, predicted_discount
 
 
 class LocalPerception(torch.nn.Module):

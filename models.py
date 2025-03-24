@@ -12,10 +12,10 @@ from x_transformers import Encoder, Decoder
 from typing import List, Tuple, Set
 from kornia.augmentation import RandomCrop
 from utils import ContrastModel, random_shift
-from delusion.losses import FeasibilityEvaluator
+from delusion.losses import ContrastiveEvaluator, FeasibilityEvaluator
+from cpprb import ReplayBuffer
 
 to_np = lambda x: x.detach().cpu().numpy()
-
 
 class RewardEMA:
     """running mean and std"""
@@ -66,7 +66,6 @@ class WorldModel(nn.Module):
             config.device,
         )
 
-        self._get_extra_losses(config)
 
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
@@ -75,6 +74,7 @@ class WorldModel(nn.Module):
             feat_size = config.dyn_stoch + config.dyn_deter
 
         self.feat_size = feat_size
+        self._get_extra_losses(config)
 
         self.heads["decoder"] = networks.MultiDecoder(
             feat_size, shapes, **config.decoder
@@ -187,7 +187,6 @@ class WorldModel(nn.Module):
                     _mets.update(
                         self.encoder.calculate_atc_loss(data["image"], K=self.atc_K)
                     )
-
                 # embed = self.encoder(data)
                 post, prior = self.dynamics.observe(
                     embed, data["action"], data["is_first"]
@@ -196,8 +195,13 @@ class WorldModel(nn.Module):
                 feat = self.dynamics.get_feat(post)
 
                 data.update({"embed": feat})
-                if self._use_evaluator:
+                data.update({"prior": prior})
+                if self._use_evaluator or self._use_discriminator:
+                    self._update_replay_buffer(data)
+                    goal_embed = self._sample_goal(data)
+                    data.update({"goal_embed": goal_embed})
                     _mets.update(self.evaluator.calculate_multihead_error(data))
+
 
                 if self._use_acro_loss:
                     # TODO: what about prior
@@ -242,6 +246,8 @@ class WorldModel(nn.Module):
                     or self._use_icm_loss
                     or self._use_mlr_loss
                     or self._use_atc_loss
+                    or self._use_evaluator
+                    or self._use_discriminator
                 ):
                     for v in _mets.values():
                         model_loss += v
@@ -259,6 +265,8 @@ class WorldModel(nn.Module):
             or self._use_icm_loss
             or self._use_mlr_loss
             or self._use_atc_loss
+            or self._use_evaluator
+            or self._use_discriminator
         ):
             for k, v in _mets.items():
                 metrics[k] = to_np(v)
@@ -284,6 +292,47 @@ class WorldModel(nn.Module):
         post = {k: v.detach() for k, v in post.items()}
         return post, context, metrics
 
+    def _update_replay_buffer(self, data):
+        self.replay_buffer.add(goal_embed=data['embed'].cpu().detach())
+
+    def _sample_goal(self, data):
+        episode_prob, pertask_prob, generate_prob = self.sample_prob["episode"], self.sample_prob["pertask"], self.sample_prob["generate"]
+        assert episode_prob + pertask_prob + generate_prob == 1.0
+        rand_value = np.random.rand()
+        if rand_value < episode_prob: 
+            return self._get_episode_goal(data)
+        elif rand_value < episode_prob + pertask_prob:
+            return self._get_pertask_goal(data)
+        else:
+            return self._get_generated_goal(data)
+
+    def _get_episode_goal(self, data):
+        B, T = data['embed'].shape[:2]
+        ind0 = torch.arange(B).repeat_interleave(T - 1)
+        ind1 = torch.randint(0, T - 1, (B * (T - 1),))
+        goal_embed = data['embed'][ind0, ind1]
+        return goal_embed.detach()
+    
+    def _get_pertask_goal(self, data):
+        B, T = data['embed'].shape[:2]
+        goal_embed_numpy = self.replay_buffer.sample(B * (T - 1))['goal_embed']
+        goal_embed = torch.Tensor(goal_embed_numpy).to(self._config.device)
+        return goal_embed.detach()
+    
+    def _get_generated_goal(self, data):
+        data_t_minus_1 = self._remove_last_time_step_and_flatten(data['prior'])
+        action_t_minus_1 = data['action'][:, :-1].reshape(-1, data['action'].shape[-1]).unsqueeze(1)
+        data_t = self.dynamics.imagine_with_action(action_t_minus_1, data_t_minus_1)
+        goal_embed = self.dynamics.get_feat(data_t).squeeze(1)
+        return goal_embed.detach()
+    
+    def _remove_last_time_step_and_flatten(self, dict_data):
+        data_except_last_timestep = {k: v[:, :-1] for k, v in dict_data.items()}
+        return {
+            k: v.reshape(-1, *v.shape[2:])
+            for k, v in data_except_last_timestep.items()
+        }
+    
     def apply_transformation(self, images: torch.Tensor):
         img_shape = images.shape
         images = images.reshape(-1, *img_shape[-3:])
@@ -316,7 +365,6 @@ class WorldModel(nn.Module):
     def video_pred(self, data):
         data = self.preprocess(data)
         embed = self.encoder(data)
-
         states, _ = self.dynamics.observe(
             embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
         )
@@ -336,13 +384,28 @@ class WorldModel(nn.Module):
 
         return torch.cat([truth, model, error], 2)
 
+    def _make_replay_buffer(self, rb_config):
+        kwargs = {'reward_func': None}
+        rb_size = rb_config["size"]
+        dict_init_pertask = {"goal_embed": {'shape': (self.feat_size,), 'dtype': 'float32', 'add_shape': (-1, self.feat_size,)}, }
+        return ReplayBuffer(rb_size, dict_init_pertask, **kwargs)
+
     def _get_extra_losses(self, config):
         self._use_evaluator = config.use_evaluator
         if self._use_evaluator:
             self.evaluator = FeasibilityEvaluator(
                 config.evaluator_config, self.encoder, self.act_space
             )
+            self.replay_buffer = self._make_replay_buffer(config.rb_config)
+            self.sample_prob = config.sample_prob
 
+        self._use_discriminator = config.use_discriminator
+        if self._use_discriminator:
+            self.evaluator = ContrastiveEvaluator(
+                config.evaluator_config
+            )
+            self.replay_buffer = self._make_replay_buffer(config.rb_config)
+            self.sample_prob = config.sample_prob
         ### Pixel shift for testing robustness
         self._use_pixel_shift = config.use_pixel_shift
         if self._use_pixel_shift:
@@ -500,7 +563,7 @@ class ImagBehavior(nn.Module):
             with torch.cuda.amp.autocast(self._use_amp):
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
-                )
+                )git
                 reward = objective(imag_feat, imag_state, imag_action)
                 actor_ent = self.actor(imag_feat).entropy()
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
@@ -516,7 +579,12 @@ class ImagBehavior(nn.Module):
                     base,
                 )
                 actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
-                actor_loss = torch.mean(actor_loss)
+                if (self._config.use_evaluator or self._config.use_discriminator) and self._config.policy_adjust:
+                    rejection_mask, dist_distance2imagined = self._get_rejection_mask_and_imagined_distance_from_evaluator(imag_feat)
+                    actor_loss[rejection_mask] = 0.0
+                    actor_loss = torch.sum(actor_loss) / (actor_loss != 0.0).sum() if (actor_loss != 0.0).sum() > 0 else actor_loss.mean() # zero division
+                else:
+                    actor_loss = torch.mean(actor_loss)
                 metrics.update(mets)
                 value_input = imag_feat
 
@@ -531,11 +599,28 @@ class ImagBehavior(nn.Module):
                     value_loss -= value.log_prob(slow_target.mode().detach())
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = weights[:-1] * value_loss[:, :, None]
-                
-                if self._config.use_evaluator:
-                    rejection_mask = self._get_rejection_mask_from_evaluator(imag_feat)
-                    value_loss[rejection_mask] = 0.0
-                value_loss = torch.mean(value_loss)
+
+                if self._config.use_evaluator or self._config.use_discriminator:
+                    rejection_mask, dist_distance2imagined = self._get_rejection_mask_and_imagined_distance_from_evaluator(imag_feat)
+                    if self._config.value_scale:
+                        rejection_mask_scaled = dist_distance2imagined[:, 0].reshape(*rejection_mask.shape)
+                        rejection_mask_scaled = rejection_mask_scaled.squeeze(-1) / rejection_mask_scaled.max(dim=1)[0]
+                        value_loss = value_loss * rejection_mask_scaled[..., None]
+                    else:
+                        value_loss[rejection_mask] = 0.0
+                    metrics["rejection_rate"] = to_np(
+                        torch.mean(rejection_mask.float())
+                    )
+                    rejection_rate_for_each_time_step = rejection_mask.float().squeeze(-1).sum(1)
+                    # now do a bar plot for wandb
+                    for i, rejection_rate in enumerate(rejection_rate_for_each_time_step):
+                        metrics[f"rejection_rate/timestep_{i}"] = float(rejection_rate)
+
+                    if dist_distance2imagined is not None:
+                        metrics["debug/dist_distance2imagined_bin0"] = dist_distance2imagined[:, 0].mean().item() * 5 # by consutrcution, this is 5[]
+                    value_loss = torch.sum(value_loss) / (value_loss != 0.0).sum() if (value_loss != 0.0).sum() > 0 else value_loss.mean() # zero division
+                else:
+                    value_loss = value_loss.mean()
 
         metrics.update(tools.tensorstats(value.mode(), "value"))
         metrics.update(tools.tensorstats(target, "target"))
@@ -554,7 +639,7 @@ class ImagBehavior(nn.Module):
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
         return imag_feat, imag_state, imag_action, weights, metrics
 
-    def _get_rejection_mask_from_evaluator(self, imag_feat):
+    def _get_rejection_mask_and_imagined_distance_from_evaluator(self, imag_feat):
         """Calculates a rejection mask based on evaluator's output.
 
         This method reshapes the input features, computes a rejection mask using the evaluator,
@@ -564,20 +649,21 @@ class ImagBehavior(nn.Module):
             imag_feat: Imagined features.
 
         Returns:
-            Rejection mask.
+            Rejection mask, which is a binary mask indicating whether the imagined features are rejected or not.
+            Distance to imagined, which is the distance between the imagined features and the nearest point in the evaluator's output.
         """
         imag_t, imag_t_plus_1 = imag_feat[:-1], imag_feat[1:]
         T, B, _ = imag_t.shape
         imag_t, imag_t_plus_1 = imag_t.reshape(T * B, -1), imag_t_plus_1.reshape(
             T * B, -1
         )
-        rejection_mask = (
-            self._world_model.evaluator.calculate_rejection_mask_from_generated_outputs(
+        rejection_mask, dist_distance2imagined = (
+            self._world_model.evaluator.calculate_rejection_mask_and_distance_from_generated_outputs(
                 imag_t, imag_t_plus_1
             )
         )
         rejection_mask = rejection_mask.reshape(T, B, -1)
-        return rejection_mask
+        return rejection_mask, dist_distance2imagined
 
     def _imagine(self, start, policy, horizon):
         dynamics = self._world_model.dynamics
