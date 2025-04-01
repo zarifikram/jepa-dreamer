@@ -452,6 +452,12 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
         sample += probs - probs.detach()
         return sample
 
+    def weighted_entropy(self, w = None):
+        if w is None:
+            return -(self.probs * self.logits).sum(-1)
+        else:
+            assert w.shape == self.logits.shape
+            return -(self.probs * self.logits * w).sum(-1)
 
 class DiscDist:
     def __init__(

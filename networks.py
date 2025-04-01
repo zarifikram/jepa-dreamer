@@ -292,6 +292,27 @@ class RSSM(nn.Module):
 
         return loss, value, dyn_loss, rep_loss
 
+    def js_loss(self, post, prior, free):
+        kld = torchd.kl.kl_divergence
+        m = {k: 0.5 * (post[k] + prior[k]) for k in post.keys()}
+        sg = lambda x: {k: v.detach() for k, v in x.items()}
+        dist = lambda x: self.get_dist(x)
+
+        loss1 = kld(
+            dist(post) if self._discrete else dist(post)._dist,
+            dist(sg(m)) if self._discrete else dist(sg(m))._dist,
+        ) * 5
+
+        loss2 = kld(
+            dist(prior) if self._discrete else dist(prior)._dist,
+            dist(sg(m)) if self._discrete else dist(sg(m))._dist,
+        ) * 5
+        
+        # this is implemented using maximum at the original repo as the gradients are not backpropagated for the out of limits.
+        loss1 = torch.clip(loss1, min=free)
+        loss2 = torch.clip(loss2, min=free)
+        loss = 0.5 * (loss1 + loss2)
+        return loss, loss1, loss1, loss2
 
 class MultiEncoder(nn.Module):
     def __init__(

@@ -1,4 +1,9 @@
+import copy
 import torch
+from utils import random_shift
+from einops import rearrange
+import torch.nn.functional as F
+
 
 perception_archs = {
     "a": [
@@ -36,14 +41,14 @@ perception_archs = {
         ("linear", 64, 2, -1, -1, -1),
     ],
     "f": [
-        ("conv", 2, 32, 3, 1, 1), # 40
-        ("maxpool", -1, -1, 2, 2, 0), # 20
-        ("conv", 32, 32, 3, 1, 1), # 20
-        ("maxpool", -1, -1, 2, 2, 0), # 10
-        ("conv", 32, 32, 3, 1, 1), # 10
-        ("maxpool", -1, -1, 2, 2, 0), # 5
-        ("conv", 32, 32, 3, 1, 1), # 5
-        ("maxpool", -1, -1, 2, 2, 0), # 2
+        ("conv", 2, 32, 3, 1, 1),  # 40
+        ("maxpool", -1, -1, 2, 2, 0),  # 20
+        ("conv", 32, 32, 3, 1, 1),  # 20
+        ("maxpool", -1, -1, 2, 2, 0),  # 10
+        ("conv", 32, 32, 3, 1, 1),  # 10
+        ("maxpool", -1, -1, 2, 2, 0),  # 5
+        ("conv", 32, 32, 3, 1, 1),  # 5
+        ("maxpool", -1, -1, 2, 2, 0),  # 2
         ("linear", 128, 2, -1, -1, -1),
     ],
 }
@@ -89,7 +94,7 @@ class ContrastiveEvaluator(torch.nn.Module):
             f"total number of parameters in the model is {sum(p.numel() for p in self.parameters())}"
         )
 
-    def calculate_multihead_error(self, data: dict):
+    def calculate_multihead_error(self, data: dict, kl_loss=None):
         base_feats, positive_feats, negative_feats = (
             self._calculate_positive_and_negative_samples(data)
         )
@@ -101,10 +106,19 @@ class ContrastiveEvaluator(torch.nn.Module):
             positive_scores,
             torch.ones(positive_scores.shape[0], device=positive_scores.device).long(),
         )
-        negative_loss = torch.nn.functional.cross_entropy(
-            negative_scores,
-            torch.zeros(negative_scores.shape[0], device=negative_scores.device).long(),
-        )
+        if kl_loss is not None:
+            considered_loss = kl_loss[:, :-1]
+            z = (considered_loss - considered_loss.mean()) / considered_loss.std()
+            gt_negative_scores = (z < -1.645).long().reshape(-1)
+            negative_loss = torch.nn.functional.cross_entropy(
+                negative_scores,
+                gt_negative_scores,
+            )
+        else:
+            negative_loss = torch.nn.functional.cross_entropy(
+                negative_scores,
+                torch.zeros(negative_scores.shape[0], device=negative_scores.device).long(),
+            )
         return {"evaluator_loss": positive_loss + negative_loss}
 
     def _calculate_positive_and_negative_samples(self, data):
@@ -160,6 +174,16 @@ class ContrastiveEvaluator(torch.nn.Module):
         x = self.layers["mlp"](x)
         return x
 
+    @torch.no_grad()
+    def calculate_comparison_embedding(self, base_feats, other_feats):
+        base_feats, other_feats = self._padding_transform(
+            base_feats
+        ), self._padding_transform(other_feats)
+        x = torch.cat([base_feats, other_feats], 1)
+        x = self.layers["conv"](x)
+        x = x.view(x.size(0), -1)
+        return x
+
     def _padding_transform(self, feats):
         B, D = feats.shape
         extra_to_add = self.assumed_height**2 - D
@@ -175,6 +199,8 @@ class ContrastiveEvaluator(torch.nn.Module):
         self, context_feats, generated_feats
     ):
         scores = self(context_feats, generated_feats).argmax(-1).bool()
+        # flip the scores
+        scores = ~scores
         return scores, None
 
 
@@ -506,3 +532,103 @@ class HistogramConverter(torch.nn.Module):
         dist.scatter_add_(-1, lower, lower_weight)
         dist.scatter_add_(-1, upper, upper_weight)
         return dist
+
+
+class ATCLoss(torch.nn.Module):
+    def __init__(self, encoder, config):
+        super(ATCLoss, self).__init__()
+        self.config = config
+        self.K = config["K"]
+        self.pad = config["pad"]
+        self.encoder = encoder
+        self.cnn = encoder._cnn
+        self.cnn_dim = config["cnn_dim"]
+        self.proj_dim = config["proj_dim"]
+        self.std_margin = config["std_margin"]
+        self._build_model()
+
+    def _build_model(self):
+        self.projector = torch.nn.Linear(self.cnn_dim, self.proj_dim)
+        self.anchor_mlp = torch.nn.Sequential(
+            torch.nn.Linear(self.proj_dim, self.proj_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(self.proj_dim, self.proj_dim),
+        )
+        self.W = torch.nn.Linear(self.proj_dim, self.proj_dim, bias=False)
+
+    def calculate_loss(self, obs):
+        anchor_embed, positive_embed = self._get_anchor_and_positive_embedding(obs)
+        atc_loss = self._calculate_atc_loss(anchor_embed, positive_embed)
+        vicreg_loss = self._calculate_vicreg_loss(anchor_embed, positive_embed)
+        return {"atc_loss": atc_loss, **vicreg_loss}
+
+    def _calculate_vicreg_loss(self, anchor, positive):
+        variance_loss = self._calculate_variance_loss(anchor, positive)
+        invariance_loss = self._calculate_invariance_loss(anchor, positive)
+        covariance_loss = self._calculate_covariance_loss(anchor, positive)
+        return {"variance_loss": variance_loss, "invariance_loss": invariance_loss, "covariance_loss": covariance_loss}
+    
+    def _calculate_variance_loss(self, anchor, positive):
+        return (self._variance_loss(anchor) + self._variance_loss(positive)) / 2
+        
+    def _variance_loss(self, x):
+        x = x - x.mean(dim=0, keepdim=True)
+        x_std = torch.sqrt(x.var(dim=0) + 0.0001)
+        return torch.mean(F.relu(self.std_margin - x_std))
+
+    def _calculate_invariance_loss(self, anchor, positive):
+        return torch.nn.functional.mse_loss(anchor, positive)
+
+    def _calculate_covariance_loss(self, anchor, positive):
+        return (self._covariance_loss(anchor) + self._covariance_loss(positive)) / 2
+
+    def _covariance_loss(self, x):
+        B, D = x.shape
+        x = x - x.mean(dim=0, keepdim=True)
+        x_cov = torch.matmul(x.T, x) / (B - 1) # divide by B - 1 to get unbiased estimate
+        x_diagonals = torch.einsum("ii->i", x_cov).pow(2).sum(dim=0)
+        return (x_cov.pow(2).sum() - x_diagonals).div(D * (D - 1))
+
+    def _calculate_atc_loss(self, anchor, positive):
+        labels = torch.arange(anchor.shape[0], dtype=torch.long, device=anchor.device)
+        logits = self._calculate_atc_logits(anchor, positive)
+        return torch.nn.functional.cross_entropy(logits, labels)
+
+    def _calculate_atc_logits(self, anchor, positive):
+        anchor_proj = self.W(anchor + self.anchor_mlp(anchor))
+        logits = torch.matmul(anchor_proj, positive.T)
+        logits = logits - torch.max(logits, dim=1, keepdim=True)[0]
+        return logits
+
+    def _get_anchor_and_positive_embedding(self, obs):
+        anchor, positive = self._get_anchor_and_positive(obs)
+        anchor, positive = self._calculate_rearranged_obs(
+            anchor
+        ), self._calculate_rearranged_obs(positive)
+        return self.projector(self.cnn(anchor)), self.projector(self.cnn(positive))
+
+    def _calculate_rearranged_obs(self, obs):
+        # assume obs (B T H W C)
+        obs = rearrange(obs, "B T H W C -> (B T) C H W")
+        obs = random_shift(obs.cpu(), pad=self.pad).to(obs.device)
+        obs = rearrange(obs, "BT C H W -> BT H W C")
+        return obs
+
+    def _get_anchor_and_positive(self, obs):
+        return obs[:, : -self.K], obs[:, self.K :]
+
+    def forward(self, data):
+        return self.atc(data)
+
+class WeightPredictor(torch.nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(WeightPredictor, self).__init__()
+        self.fc = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, 16),
+            torch.nn.ReLU(),
+            torch.nn.Linear(16, output_dim),
+            torch.nn.Softplus()  # Softplus ensures the output weights are positive
+        )
+    
+    def forward(self, x):
+        return self.fc(x)

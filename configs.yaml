@@ -9,11 +9,11 @@ defaults:
   deterministic_run: False
   steps: 1e6
   parallel: False
-  eval_every: 1e5 
+  eval_every: 2e4
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
-  device: 'cuda:3'
+  device: 'cuda:0'
   compile: True
   precision: 32
   debug: False
@@ -238,6 +238,10 @@ updates:
 
 # gan discriminator
   use_discriminator: False
+
+# update atc
+  use_updated_atc_loss: False
+
 mlr:
   use_mlr_loss: True
  
@@ -289,11 +293,19 @@ discriminator:
   sample_prob: {"episode": 0.0, "pertask": 0.0, "generate": 1.0}
   rb_config: {"size": 500000,}
   value_scale: False
-  policy_adjust: True
+  policy_adjust: False
+
+update_atc:
+  use_updated_atc_loss: True
+  atc_config: {
+    "K": 4,
+    "pad": 4,
+    "cnn_dim": 4096,
+    "proj_dim": 256,
+    "std_margin": 1.0,
+  }
 
 
 
 
-
-
-
+# act ent is 3e-4
