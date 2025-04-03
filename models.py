@@ -12,7 +12,13 @@ from x_transformers import Encoder, Decoder
 from typing import List, Tuple, Set
 from kornia.augmentation import RandomCrop
 from utils import ContrastModel, random_shift
-from delusion.losses import ATCLoss, ContrastiveEvaluator, FeasibilityEvaluator, WeightPredictor
+from delusion.losses import (
+    ATCLoss,
+    ContrastiveEvaluator,
+    FeasibilityEvaluator,
+    SupervisedContrastiveLoss,
+    WeightPredictor,
+)
 from cpprb import ReplayBuffer
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -215,7 +221,7 @@ class WorldModel(nn.Module):
                     self._update_replay_buffer(data)
                     goal_embed = self._sample_goal(data)
                     data.update({"goal_embed": goal_embed})
-                    _mets.update(self.evaluator.calculate_multihead_error(data, kl_loss))
+                    _mets.update(self.evaluator.calculate_multihead_error(data))
 
                 if self._use_acro_loss:
                     # TODO: what about prior
@@ -228,7 +234,9 @@ class WorldModel(nn.Module):
                         )
                     )
 
-                
+                if self._use_scl_loss:
+                    _mets.update(self.scl.calculate_loss(feat))
+
                 preds = {}
                 for name, head in self.heads.items():
                     grad_head = name in self._config.grad_heads
@@ -257,6 +265,7 @@ class WorldModel(nn.Module):
                     or self._use_evaluator
                     or self._use_discriminator
                     or self._use_updated_atc_loss
+                    or self._use_scl_loss
                 ):
                     for v in _mets.values():
                         model_loss += v
@@ -275,6 +284,31 @@ class WorldModel(nn.Module):
         metrics["rep_mean"] = to_np(torch.mean(rep_loss))
         metrics["rep_variance"] = to_np(torch.var(rep_loss))
 
+        # post_cosine_dist = self.calculate_pairwise_cosine_similarity(
+        #     self.dynamics.get_feat(post)
+        # )
+        # prior_cosine_dist = self.calculate_pairwise_cosine_similarity(
+        #     self.dynamics.get_feat(prior)
+        # )
+
+        # for i in range(post_cosine_dist.shape[0]):
+        #     metrics[f"post/cosine_dist_{i}"] = to_np(post_cosine_dist[i])
+        #     metrics[f"prior/cosine_dist_{i}"] = to_np(prior_cosine_dist[i])
+
+        # latent metrics
+        with torch.no_grad():
+            explained_variance_ratio = self._calculate_explained_vairance_ratio(feat)
+            log_determinant = self._calculate_log_determinant_of_gram_matrix(feat)
+            mahalanobis_distance = self._calculate_mahalanobis_distance(feat)
+        metrics[f"coverage/explained_variance_ratio"] = explained_variance_ratio
+        metrics[f"coverage/log_determinant"] = log_determinant
+        metrics[f"coverage/mahalanobis_distance_mean"] = to_np(
+            mahalanobis_distance.mean()
+        )
+        metrics[f"coverage/mahalanobis_distance_std"] = to_np(
+            mahalanobis_distance.std()
+        )
+
         if (
             self._use_acro_loss
             or self._use_icm_loss
@@ -283,6 +317,7 @@ class WorldModel(nn.Module):
             or self._use_evaluator
             or self._use_discriminator
             or self._use_updated_atc_loss
+            or self._use_scl_loss
         ):
             for k, v in _mets.items():
                 metrics[k] = to_np(v)
@@ -307,6 +342,42 @@ class WorldModel(nn.Module):
         #     )
         post = {k: v.detach() for k, v in post.items()}
         return post, context, metrics
+
+    def _calculate_explained_vairance_ratio(self, feat):
+        x = feat.reshape(-1, feat.shape[-1])
+        x = x - x.mean(dim=0)
+        u, s, v = torch.svd(x)
+        explained_variance = s**2 / (x.shape[0] - 1)
+        total_variance = explained_variance.sum()
+        explained_variance_ratio = explained_variance / total_variance
+
+        # how many dimensions are needed to explain 95% of the variance
+        cumulative_variance = torch.cumsum(explained_variance_ratio, dim=0)
+        num_dimensions = torch.sum(cumulative_variance < 0.95).item()
+        return num_dimensions / len(explained_variance_ratio)
+
+    def _calculate_log_determinant_of_gram_matrix(self, feat):
+        x = feat.reshape(-1, feat.shape[-1])
+        x = x - x.mean(dim=0)
+        gram_matrix = x @ x.T
+        epsilon = 1e-6
+        gram_matrix += epsilon * torch.eye(x.shape[0], device=x.device)
+        log_determinant = torch.logdet(gram_matrix)
+        # if log_determinant is nan make it zero
+        if torch.isnan(log_determinant):
+            return 0.0
+        return log_determinant.item()
+
+    def _calculate_mahalanobis_distance(self, feat):
+        x = feat.reshape(-1, feat.shape[-1])
+        x = x - x.mean(dim=0)
+        cov_matrix = x.T @ x / (x.shape[0] - 1)
+        epsilon = 1e-6
+        cov_matrix += epsilon * torch.eye(x.shape[-1], device=x.device)
+        inv_cov_matrix = torch.inverse(cov_matrix)
+        mahalanobis_distance = torch.sum(torch.matmul(x, inv_cov_matrix) * x, dim=1)
+        mahalanobis_distance = torch.sqrt(mahalanobis_distance)
+        return mahalanobis_distance
 
     def _update_replay_buffer(self, data):
         self.replay_buffer.add(goal_embed=data["embed"].cpu().detach())
@@ -420,7 +491,15 @@ class WorldModel(nn.Module):
         }
         return ReplayBuffer(rb_size, dict_init_pertask, **kwargs)
 
+    def calculate_pairwise_cosine_similarity(self, feats):
+        lhs = feats[:, 0:1].repeat(1, feats.shape[1], 1)
+        return torch.cosine_similarity(lhs, feats, dim=-1).mean(0)
+
     def _get_extra_losses(self, config):
+        self._use_scl_loss = config.use_scl_loss
+        if self._use_scl_loss:
+            self.scl = SupervisedContrastiveLoss.build(config.scl_config)
+
         self._use_evaluator = config.use_evaluator
         if self._use_evaluator:
             self.evaluator = FeasibilityEvaluator(
@@ -524,7 +603,7 @@ class ImagBehavior(nn.Module):
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
         self.weight_predictor = WeightPredictor(128, config.num_actions)
-        
+
         self.actor = networks.MLP(
             feat_size,
             (config.num_actions,),
@@ -702,13 +781,25 @@ class ImagBehavior(nn.Module):
         with tools.RequiresGrad(self):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
+
+        # imag_feat_cosine_similarity = (
+        #     self._world_model.calculate_pairwise_cosine_similarity(
+        #         imag_feat.permute(1, 0, 2)
+        #     )
+        # )
+        # for i in range(imag_feat_cosine_similarity.shape[0]):
+        #     metrics[f"imag_feat/cosine_dist_{i}"] = to_np(
+        #         imag_feat_cosine_similarity[i]
+        #     )
         return imag_feat, imag_state, imag_action, weights, metrics
 
     def _get_weighted_entropy(self, imag_feat):
         w = self._get_weights_for_entropy(imag_feat)
-        w = torch.cat([w, torch.ones_like(w[:1])], dim=0) # last dim doesn't matter anyway
+        w = torch.cat(
+            [w, torch.ones_like(w[:1])], dim=0
+        )  # last dim doesn't matter anyway
         return self.actor(imag_feat).weighted_entropy(w)
-        
+
     def _get_rejection_mask_and_imagined_distance_from_evaluator(self, imag_feat):
         """Calculates a rejection mask based on evaluator's output.
 

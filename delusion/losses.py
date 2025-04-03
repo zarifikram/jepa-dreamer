@@ -1,8 +1,10 @@
+from abc import abstractmethod
 import copy
 import torch
 from utils import random_shift
 from einops import rearrange
 import torch.nn.functional as F
+from sklearn.cluster import KMeans
 
 
 perception_archs = {
@@ -107,7 +109,7 @@ class ContrastiveEvaluator(torch.nn.Module):
             torch.ones(positive_scores.shape[0], device=positive_scores.device).long(),
         )
         if kl_loss is not None:
-            considered_loss = kl_loss[:, :-1]
+            considered_loss = kl_loss[:, 1:]
             z = (considered_loss - considered_loss.mean()) / considered_loss.std()
             gt_negative_scores = (z < -1.645).long().reshape(-1)
             negative_loss = torch.nn.functional.cross_entropy(
@@ -632,3 +634,123 @@ class WeightPredictor(torch.nn.Module):
     
     def forward(self, x):
         return self.fc(x)
+
+class SupervisedContrastiveLoss:
+    def __init__(self, config):
+        self.temperature = config["temperature"]
+        self.n_labels = config["n_labels"]
+        self.latent_dim = config["latent_dim"]
+        self.n_views = config["n_views"]
+
+    def calculate_loss(self, features):
+        # features should be of shape (batch_size, time, feature_dim)
+        features = F.normalize(features, dim=-1)
+        labels = self._calculate_labels(features)
+        loss = self._calculate_loss(features, labels)
+        return {"supervised_contrastive_loss": loss}
+    
+    @abstractmethod
+    def _calculate_labels(self, features):
+        # This method should be implemented in subclasses. Returns B, T, 1 labels
+        raise NotImplementedError("Subclasses should implement this method.")
+
+    @abstractmethod
+    def _calculate_loss(self, features, labels):
+        # This method should be implemented in subclasses. Returns the loss value
+        raise NotImplementedError("Subclasses should implement this method.")
+   
+
+    def forward(self, features, labels=None):
+        device = features.device
+
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...],'
+                             'at least 3 dimensions are required')
+
+        batch_size = features.shape[0]
+
+        labels = labels.contiguous().view(-1, 1)
+        
+        mask = self._calculate_mask(labels)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+
+        anchor_feature = contrast_feature
+        anchor_count = contrast_count
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = (torch.exp(logits) + 1e-6) * logits_mask 
+        
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        mask_pos_pairs = mask.sum(1)
+        mask_pos_pairs = torch.where(mask_pos_pairs < 1e-6, 1, mask_pos_pairs)
+        mean_log_prob_pos = -(mask * log_prob).sum(1) / mask_pos_pairs
+
+        loss = mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+        return loss
+    
+    def _calculate_mask(self, labels):
+        return torch.eq(labels, labels.T).float().to(labels.device)
+    
+    @staticmethod
+    def build(config):
+        loss_type = config["loss_type"]
+        if loss_type == "kmeans":
+            return KMeansContrastiveLoss(config)
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+
+    
+class KMeansContrastiveLoss(SupervisedContrastiveLoss):
+    def __init__(self, config):
+        super(KMeansContrastiveLoss, self).__init__(config)
+        self.kmeans = KMeans(n_clusters=self.n_labels, random_state=0)
+        self.init_centers = None
+
+    def _calculate_labels(self, features):
+        # Reshape features to (batch_size * time, feature_dim)
+        reshaped_features = features.view(-1, self.latent_dim).detach().cpu().numpy()
+        if self.init_centers is None:
+            kmeans = KMeans(n_clusters=self.n_labels, random_state=0).fit(reshaped_features)
+        else:
+            kmeans = KMeans(n_clusters=self.n_labels, init=self.init_centers, n_init=1).fit(reshaped_features)
+        
+        labels = torch.tensor(kmeans.labels_, device=features.device).view(features.shape[0], -1, 1)
+        self.init_centers = kmeans.cluster_centers_
+        
+        return labels
+    
+    def _calculate_loss(self, features, labels):
+        # Calculate the contrastive loss using the labels generated by KMeans
+        x, y = features.view(-1, self.latent_dim), labels.view(-1, 1)
+        x = self._generate_views(x)
+        return super().forward(x, y)
+
+    def _generate_views(self, x):
+        x = x.unsqueeze(1).repeat(1, self.n_views, 1)
+        x[:, 1:] = x[:, 1:] + torch.randn_like(x[:, 1:]) * 0.01 # leave the first view unchanged
+        return x
+    
+    

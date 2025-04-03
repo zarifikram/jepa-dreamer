@@ -242,6 +242,9 @@ updates:
 # update atc
   use_updated_atc_loss: False
 
+# scl
+  use_scl_loss: False
+
 mlr:
   use_mlr_loss: True
  
@@ -293,7 +296,7 @@ discriminator:
   sample_prob: {"episode": 0.0, "pertask": 0.0, "generate": 1.0}
   rb_config: {"size": 500000,}
   value_scale: False
-  policy_adjust: False
+  policy_adjust: True
 
 update_atc:
   use_updated_atc_loss: True
@@ -305,7 +308,15 @@ update_atc:
     "std_margin": 1.0,
   }
 
-
+scl:
+  use_scl_loss: True
+  scl_config: {
+    "n_labels": 16,
+    "latent_dim": 1536,
+    "temperature": 0.07,
+    "n_views": 4,
+    "loss_type": "kmeans",
+  }
 
 
 # act ent is 3e-4

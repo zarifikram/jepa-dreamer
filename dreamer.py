@@ -20,6 +20,7 @@ from parallel import Parallel, Damy
 import torch
 from torch import nn
 from torch import distributions as torchd
+torch.cuda.empty_cache() 
 
 import wandb
 
