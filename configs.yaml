@@ -312,10 +312,11 @@ scl:
   use_scl_loss: True
   scl_config: {
     "n_labels": 16,
-    "latent_dim": 1536,
+    "latent_dim": 4096,
     "temperature": 0.07,
     "n_views": 4,
-    "loss_type": "kmeans",
+    "loss_type": "prototype",
+    "pad": 4,
   }
 
 

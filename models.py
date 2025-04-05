@@ -208,13 +208,13 @@ class WorldModel(nn.Module):
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
                 rep_scale = self._config.rep_scale
-                # kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
-                #     post, prior, kl_free, dyn_scale, rep_scale
-                # )
-                kl_free = 0.2
-                kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.js_loss(
-                    post, prior, kl_free
+                kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
+                    post, prior, kl_free, dyn_scale, rep_scale
                 )
+                # kl_free = 0.2
+                # kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.js_loss(
+                #     post, prior, kl_free
+                # )
                 assert kl_loss.shape == embed.shape[:2], kl_loss.shape
 
                 if self._use_evaluator or self._use_discriminator:
@@ -235,7 +235,8 @@ class WorldModel(nn.Module):
                     )
 
                 if self._use_scl_loss:
-                    _mets.update(self.scl.calculate_loss(feat))
+                    # _mets.update(self.scl.calculate_loss(feat))
+                    _mets.update(self.scl.calculate_loss(embed, self.encoder, data["image"]))
 
                 preds = {}
                 for name, head in self.heads.items():
@@ -296,18 +297,18 @@ class WorldModel(nn.Module):
         #     metrics[f"prior/cosine_dist_{i}"] = to_np(prior_cosine_dist[i])
 
         # latent metrics
-        with torch.no_grad():
-            explained_variance_ratio = self._calculate_explained_vairance_ratio(feat)
-            log_determinant = self._calculate_log_determinant_of_gram_matrix(feat)
-            mahalanobis_distance = self._calculate_mahalanobis_distance(feat)
-        metrics[f"coverage/explained_variance_ratio"] = explained_variance_ratio
-        metrics[f"coverage/log_determinant"] = log_determinant
-        metrics[f"coverage/mahalanobis_distance_mean"] = to_np(
-            mahalanobis_distance.mean()
-        )
-        metrics[f"coverage/mahalanobis_distance_std"] = to_np(
-            mahalanobis_distance.std()
-        )
+        # with torch.no_grad():
+        #     explained_variance_ratio = self._calculate_explained_vairance_ratio(feat)
+        #     log_determinant = self._calculate_log_determinant_of_gram_matrix(feat)
+        #     mahalanobis_distance = self._calculate_mahalanobis_distance(feat)
+        # metrics[f"coverage/explained_variance_ratio"] = explained_variance_ratio
+        # metrics[f"coverage/log_determinant"] = log_determinant
+        # metrics[f"coverage/mahalanobis_distance_mean"] = to_np(
+        #     mahalanobis_distance.mean()
+        # )
+        # metrics[f"coverage/mahalanobis_distance_std"] = to_np(
+        #     mahalanobis_distance.std()
+        # )
 
         if (
             self._use_acro_loss
