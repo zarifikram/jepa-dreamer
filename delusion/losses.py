@@ -810,3 +810,107 @@ class PrototypeContrastiveLoss(SupervisedContrastiveLoss):
         k = prototypes.shape[0]
         diag = torch.eye(k, device=prototypes.device)
         return ((sim - diag)**2).sum() / (k*(k-1))
+
+class TemporalConsistancyLoss(torch.nn.Module):
+    def __init__(self, config):
+        super(TemporalConsistancyLoss, self).__init__()
+        self.config = config
+        self.latent_dim = config["latent_dim"]
+        self.k = config["k"]
+        self.tau = config["tau"]
+        self.loss_type = config["loss_type"]
+        self.delta = config["delta"]
+        if self.loss_type == "predictive":
+            self.predictor = torch.nn.Linear(self.latent_dim, 2*self.latent_dim) # mu and logvar
+        self.mu, self.std = None, None
+
+    def calculate_loss(self, features):
+        # features should be of shape (batch_size, time, feature_dim)
+        features = F.normalize(features, dim=-1)
+        tc_loss = self._temporal_contrastive_loss(features) if self.loss_type == "contrastive" else self._temporal_predictive_loss(features)
+        return {"temporal_contrastive_loss": tc_loss}
+
+    def _temporal_predictive_loss(self, x):
+        # anchor and positive used loosely to allude to contrastive learning and not the actual meaning
+        anchor = x[:, :-self.k].reshape(-1, self.latent_dim)  # Shape: (B*(T-k), D)
+        positive = self._calculate_positive(x)  # Shape: (B*(T-k), k, D)
+        predicted_positive = self._calculate_predicted_positive(anchor)  # Shape: (B*(T-k), k, D)
+        return self._calculate_weighted_mse_loss(predicted_positive, positive)
+    
+    def _calculate_weighted_mse_loss(self, predicted_positive, positive):
+        weights = torch.exp(-self.delta * torch.arange(self.k, device=predicted_positive.device))
+        weights = weights / weights.sum()
+        mse_loss = torch.nn.functional.mse_loss(predicted_positive, positive, reduction='none')
+        weighted_mse_loss = (mse_loss * weights.unsqueeze(-1).unsqueeze(0)).sum(dim=1).mean(-1)
+        self.mu, self.std = weighted_mse_loss.mean(), weighted_mse_loss.std()
+        return weighted_mse_loss.mean()
+    
+    def _calculate_positive(self, x):
+        B, T, D = x.shape
+        positive_idx = self._calculate_next_k_indices(B, T, x.device)  # (B*(T-k), k)
+        positive = x.reshape(-1, D)[positive_idx.reshape(-1)].reshape(-1, self.k, D)  # (B*(T-k), k, D)
+        return positive
+
+    def _calculate_predicted_positive(self, anchor):
+        mu, logvar = self.predictor(anchor).chunk(2, dim=-1)
+        mu = mu.unsqueeze(1).repeat(1, self.k, 1)  # Shape: (B*(T-k), k, D)
+        logvar = logvar.unsqueeze(1).repeat(1, self.k, 1)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std  # Shape: (B*(T-k), k, D)
+
+
+    def _temporal_contrastive_loss(self, x):
+        B, T, D = x.shape
+        sim = self._calculate_cosine_similarity(x)  # (B*(T-k), B*T)
+        
+        postive_idx = self._calculate_next_k_indices(B, T, x.device)  # (B*(T-k), k)
+        positive_similarities = sim.gather(dim=1, index=postive_idx)  # (B*(T-k), k)
+
+        all_offset = torch.arange(0, B * T, device=x.device).view(B, T)
+        all_idx = all_offset.unsqueeze(1).repeat(1, T - self.k, 1).reshape(-1, T)  # (B*(T-k), T)         
+        all_similarities = sim.gather(dim=1, index=all_idx)  # (B*(T-k), T) # we care about the features _in_ the same sequence
+                
+        loss = torch.logsumexp(all_similarities, dim=1) - torch.logsumexp(positive_similarities, dim=1)
+        return loss.mean()
+    
+    def _calculate_cosine_similarity(self, x):
+        B, T, D = x.shape
+        anchors = x[:, :-self.k].reshape(-1, D)  # Shape: (B*(T-k), D)
+        candidates = x.reshape(B * T, D) # Shape: (B*T, D)
+        
+        return torch.matmul(anchors, candidates.T) / self.tau  # Shape: (B*(T-k), B*T)
+    
+    def _calculate_next_k_indices(self, B, T, device):
+        b_idx = torch.arange(B, device=device).unsqueeze(1).repeat(1, T - self.k)  # (B, T-k)
+        t_idx = torch.arange(T - self.k, device=device).unsqueeze(0).repeat(B, 1)    # (B, T-k)
+        
+        # For each anchor, calculate positive indices in the flattened candidate space.
+        # For an anchor at time t in batch b, its positive indices are: b * T + (t+1, ..., t+k).
+        pos_offset = torch.arange(1, self.k + 1, device=device).view(1, 1, -1)  # (1, 1, k)
+        pos_idx = b_idx.unsqueeze(-1) * T + (t_idx.unsqueeze(-1) + pos_offset)  # (B, T-k, k)
+        pos_idx = pos_idx.reshape(-1, self.k)  # (B*(T-k), k)
+        return pos_idx
+    
+    @torch.no_grad()
+    def calculate_rejection_mask_and_distance_from_generated_outputs(
+        self, context_feats, generated_feats
+    ):
+        # normalize the features
+        s_t, s_t_plus_one = F.normalize(context_feats, dim=-1), F.normalize(generated_feats, dim=-1)
+        if self.loss_type == "predictive":
+            # calculate the distance
+            rejection_mask = self._calculate_rejection_mask_predictive(s_t, s_t_plus_one)
+        elif self.loss_type == "contrastive":
+            raise NotImplementedError("Contrastive rejection mask calculation is not implemented.")
+        return rejection_mask, None
+
+    def _calculate_rejection_mask_predictive(self, s_t, s_t_plus_one):
+        deter_t, deter_t_plus_one = s_t[:, -self.latent_dim:], s_t_plus_one[:, -self.latent_dim:]
+        predicted_deter_t_plus_one = self._calculate_predicted_positive(deter_t) # (B, k, D)
+        prediction_error = (deter_t_plus_one.unsqueeze(1) - predicted_deter_t_plus_one).pow(2).mean(dim=[1, 2])
+        prediction_error = (prediction_error - self.mu) / self.std
+        # reject ones with 5% of the distribution
+        rejection_mask = prediction_error > 1.645
+        return rejection_mask
+

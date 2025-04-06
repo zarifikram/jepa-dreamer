@@ -245,6 +245,9 @@ updates:
 # scl
   use_scl_loss: False
 
+# tcl
+  use_tcl_loss: False
+
 mlr:
   use_mlr_loss: True
  
@@ -321,3 +324,14 @@ scl:
 
 
 # act ent is 3e-4
+tcl:
+  use_tcl_loss: True
+  tcl_config: {
+      "latent_dim": 512,
+      "loss_type": "predictive", # or contrastive
+      "temperature": 0.1,
+      "k": 32,
+      "tau": 0.1,
+      "delta": 0.5,
+    }
+  value_scale: False

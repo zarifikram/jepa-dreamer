@@ -17,6 +17,7 @@ from delusion.losses import (
     ContrastiveEvaluator,
     FeasibilityEvaluator,
     SupervisedContrastiveLoss,
+    TemporalConsistancyLoss,
     WeightPredictor,
 )
 from cpprb import ReplayBuffer
@@ -236,7 +237,12 @@ class WorldModel(nn.Module):
 
                 if self._use_scl_loss:
                     # _mets.update(self.scl.calculate_loss(feat))
-                    _mets.update(self.scl.calculate_loss(embed, self.encoder, data["image"]))
+                    _mets.update(
+                        self.scl.calculate_loss(embed, self.encoder, data["image"])
+                    )
+                
+                if self._use_tcl_loss:
+                    _mets.update(self.tcl.calculate_loss(post["deter"]))
 
                 preds = {}
                 for name, head in self.heads.items():
@@ -267,6 +273,7 @@ class WorldModel(nn.Module):
                     or self._use_discriminator
                     or self._use_updated_atc_loss
                     or self._use_scl_loss
+                    or self._use_tcl_loss
                 ):
                     for v in _mets.values():
                         model_loss += v
@@ -319,6 +326,7 @@ class WorldModel(nn.Module):
             or self._use_discriminator
             or self._use_updated_atc_loss
             or self._use_scl_loss
+            or self._use_tcl_loss
         ):
             for k, v in _mets.items():
                 metrics[k] = to_np(v)
@@ -497,6 +505,12 @@ class WorldModel(nn.Module):
         return torch.cosine_similarity(lhs, feats, dim=-1).mean(0)
 
     def _get_extra_losses(self, config):
+        self._use_tcl_loss = config.use_tcl_loss
+        if self._use_tcl_loss:
+            self.tcl = TemporalConsistancyLoss(
+                config.tcl_config,
+            )
+
         self._use_scl_loss = config.use_scl_loss
         if self._use_scl_loss:
             self.scl = SupervisedContrastiveLoss.build(config.scl_config)
@@ -726,7 +740,7 @@ class ImagBehavior(nn.Module):
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = weights[:-1] * value_loss[:, :, None]
 
-                if self._config.use_evaluator or self._config.use_discriminator:
+                if self._config.use_evaluator or self._config.use_discriminator or self._config.use_tcl_loss:
                     rejection_mask, dist_distance2imagined = (
                         self._get_rejection_mask_and_imagined_distance_from_evaluator(
                             imag_feat
@@ -822,7 +836,9 @@ class ImagBehavior(nn.Module):
         rejection_mask, dist_distance2imagined = (
             self._world_model.evaluator.calculate_rejection_mask_and_distance_from_generated_outputs(
                 imag_t, imag_t_plus_1
-            )
+            ) if hasattr(self._world_model, "evaluator") else self._world_model.tcl.calculate_rejection_mask_and_distance_from_generated_outputs(
+                imag_t, imag_t_plus_1
+            ) 
         )
         rejection_mask = rejection_mask.reshape(T, B, -1)
         return rejection_mask, dist_distance2imagined
