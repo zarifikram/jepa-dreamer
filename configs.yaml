@@ -328,10 +328,10 @@ tcl:
   use_tcl_loss: True
   tcl_config: {
       "latent_dim": 512,
-      "loss_type": "predictive", # or contrastive
+      "loss_type": "contrastive", # or contrastive
       "temperature": 0.1,
       "k": 32,
-      "tau": 0.1,
+      "tau": 0.05,
       "delta": 0.5,
     }
   value_scale: False

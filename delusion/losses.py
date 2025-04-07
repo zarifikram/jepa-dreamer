@@ -872,6 +872,7 @@ class TemporalConsistancyLoss(torch.nn.Module):
         all_similarities = sim.gather(dim=1, index=all_idx)  # (B*(T-k), T) # we care about the features _in_ the same sequence
                 
         loss = torch.logsumexp(all_similarities, dim=1) - torch.logsumexp(positive_similarities, dim=1)
+        self.mu, self.std = positive_similarities.mean(-1).mean(), positive_similarities.mean(-1).std()
         return loss.mean()
     
     def _calculate_cosine_similarity(self, x):
@@ -902,7 +903,7 @@ class TemporalConsistancyLoss(torch.nn.Module):
             # calculate the distance
             rejection_mask = self._calculate_rejection_mask_predictive(s_t, s_t_plus_one)
         elif self.loss_type == "contrastive":
-            raise NotImplementedError("Contrastive rejection mask calculation is not implemented.")
+            rejection_mask = self._calculate_rejection_mask_contrastive(s_t, s_t_plus_one)
         return rejection_mask, None
 
     def _calculate_rejection_mask_predictive(self, s_t, s_t_plus_one):
@@ -914,3 +915,14 @@ class TemporalConsistancyLoss(torch.nn.Module):
         rejection_mask = prediction_error > 1.645
         return rejection_mask
 
+    def _calculate_rejection_mask_contrastive(self, s_t, s_t_plus_one):
+        # calculate the rejection mask based on the cosine similarity
+        # both s_t and s_t plus one is (B, d). Calculate cosine similarity to get (B,)
+        cosine_similarity = (torch.nn.functional.cosine_similarity(s_t, s_t_plus_one, dim=-1) / self.tau - self.mu) / self.std
+
+        # reject ones with 5% of the distribution
+        rejection_mask = cosine_similarity < -1.645
+        return rejection_mask
+
+
+        
