@@ -335,3 +335,4 @@ tcl:
       "delta": 0.5,
     }
   value_scale: False
+  value_adjust: False

@@ -740,7 +740,7 @@ class ImagBehavior(nn.Module):
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = weights[:-1] * value_loss[:, :, None]
 
-                if self._config.use_evaluator or self._config.use_discriminator or self._config.use_tcl_loss:
+                if self._config.use_evaluator or self._config.use_discriminator or (self._config.use_tcl_loss and self._config.value_adjust):
                     rejection_mask, dist_distance2imagined = (
                         self._get_rejection_mask_and_imagined_distance_from_evaluator(
                             imag_feat
