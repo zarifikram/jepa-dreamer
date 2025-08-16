@@ -91,7 +91,9 @@ class Logger:
             else:
                 self._writer.add_scalar(name, value, step)
         for name, value in self._images.items():
-            self._writer.add_image(name, value, step)
+            if np.issubdtype(value.dtype, np.floating):
+                value = np.clip(255 * value, 0, 255).astype(np.uint8)
+            # self._writer.add_image(name, value, step)
             wandb.log({name: wandb.Image(value)}, step=step)
         for name, value in self._videos.items():
             name = name if isinstance(name, str) else name.decode("utf-8")
@@ -727,6 +729,47 @@ def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
         returns = returns.permute(dims)
     return returns
 
+def lambda_return_lol(reward, value, pcont, bootstrap, lambda_, axis, mask_reject=None):
+    assert len(reward.shape) == len(value.shape), (reward.shape, value.shape)
+    if isinstance(pcont, (int, float)):
+        pcont = pcont * torch.ones_like(reward)
+    dims = list(range(len(reward.shape)))
+    dims = [axis] + dims[1:axis] + [0] + dims[axis + 1:]
+    value_ = value.clone().detach() 
+    if axis != 0:
+        reward = reward.permute(dims)
+        value = value.permute(dims)
+        pcont = pcont.permute(dims)
+    if bootstrap is None:
+        bootstrap = torch.zeros_like(value[-1])
+    if mask_reject is not None:
+        bootstrap[mask_reject[-1].reshape(bootstrap.shape)] = torch.nan
+    next_values = torch.cat([value[1:], bootstrap[None]], 0)
+    if mask_reject is not None:
+        next_values[mask_reject.reshape(next_values.shape)] = torch.nan
+    inputs = reward + pcont * next_values * (1 - lambda_)
+    def accumulate(agg, input, pcont, value):
+        out = input + pcont * lambda_ * agg
+        mask_nan = torch.isnan(out)
+        if mask_nan.any():
+            out[mask_nan] = value[mask_nan]
+        return out
+    returns = sequence_scan(accumulate, bootstrap, inputs, pcont, value, reverse=True)
+    if mask_reject is not None and mask_reject.any():
+        mask_nan_returns = torch.isnan(returns)
+        if mask_nan_returns.any():
+            try:
+                assert mask_reject[mask_nan_returns].all()
+            except:
+                breakpoint()
+        mask_should_be_same_value = mask_reject & ~mask_nan_returns
+        if mask_should_be_same_value.any():
+            assert (returns[mask_should_be_same_value] == value[mask_should_be_same_value]).all()
+        returns[mask_reject.flatten(1)] = torch.nan
+    if axis != 0:
+        returns = returns.permute(dims)
+
+    return returns.unbind(axis=1)
 
 class Optimizer:
     def __init__(
@@ -848,6 +891,71 @@ def static_scan(fn, inputs, start):
     if type(last) == type({}):
         outputs = [outputs]
     return outputs
+
+
+def sequence_scan(fn, state, *inputs, reverse=False):
+    indices = range(inputs[0].shape[0])
+    select_index = lambda inputs, i: [input[i] for input in inputs]
+    last = (state,)
+    outs = []
+    if reverse:
+        indices = reversed(indices)
+    for index in indices:
+        last = fn(last[0], *select_index(inputs, index))  # zero since we want the state to be a dict
+        last = last if isinstance(last, tuple) else (last,)
+
+        outs.append(last)  # outs are envolved in tuples
+    if reverse:
+        outs = outs[::-1]
+
+    # FIXME this is awfulllllllllll
+    # create right structure
+    if isinstance(outs[0][0], dict):
+        # create dictionary structure
+        output = list({} for _ in range(len(outs[0])))  # create lists
+        for o in outs:
+            for i_d, dictionary in enumerate(o):
+                if isinstance(dictionary, dict):  # FIXME
+                    for key in dictionary.keys():
+                        if key not in output[i_d]:
+                            output[i_d][key] = [dictionary[key]]
+                        else:
+                            output[i_d][key].append(dictionary[key])
+                elif isinstance(dictionary, torch.Tensor):
+                    # here we append elements to list
+                    if not isinstance(output[i_d], list):
+                        output[i_d] = []
+                    output[i_d].append(dictionary)
+                else:
+                    raise NotImplementedError(f"sequence scan - creating structure - type {type(dictionary)}")
+
+        # torch stack all entries
+        for i_o, dictionary in enumerate(output):
+            if isinstance(dictionary, dict):  # FIXME
+                for key in dictionary.keys():
+                    dictionary[key] = torch.stack(dictionary[key], 0)
+            elif isinstance(dictionary, list):
+                output[i_o] = torch.stack(dictionary, 0)
+
+            else:
+                raise NotImplementedError(f"sequence scan - stacking - type {type(dictionary)}")
+
+    elif isinstance(outs[0][0], torch.Tensor):
+        # create tensor structure
+        # no output tuple, flatten all in same stack
+        # and is very specific to the problem
+        # and is awful
+        output = []
+        for o in outs:
+            for tensor in o:  # flatten tuple
+                output.append(tensor)
+
+        output = torch.stack(output, 0)
+
+    else:
+        raise NotImplementedError(f"sequence scan - Not implemented type {type(outs[0])}")
+
+    return output
 
 
 class Every:

@@ -901,10 +901,10 @@ class TemporalConsistancyLoss(torch.nn.Module):
         s_t, s_t_plus_one = F.normalize(context_feats, dim=-1), F.normalize(generated_feats, dim=-1)
         if self.loss_type == "predictive":
             # calculate the distance
-            rejection_mask = self._calculate_rejection_mask_predictive(s_t, s_t_plus_one)
+            rejection_mask, distance = self._calculate_rejection_mask_predictive(s_t, s_t_plus_one)
         elif self.loss_type == "contrastive":
-            rejection_mask = self._calculate_rejection_mask_contrastive(s_t, s_t_plus_one)
-        return rejection_mask, None
+            rejection_mask, distance = self._calculate_rejection_mask_contrastive(s_t, s_t_plus_one)
+        return rejection_mask, distance
 
     def _calculate_rejection_mask_predictive(self, s_t, s_t_plus_one):
         deter_t, deter_t_plus_one = s_t[:, -self.latent_dim:], s_t_plus_one[:, -self.latent_dim:]
@@ -913,7 +913,7 @@ class TemporalConsistancyLoss(torch.nn.Module):
         prediction_error = (prediction_error - self.mu) / self.std
         # reject ones with 5% of the distribution
         rejection_mask = prediction_error > 1.645
-        return rejection_mask
+        return rejection_mask, prediction_error
 
     def _calculate_rejection_mask_contrastive(self, s_t, s_t_plus_one):
         # calculate the rejection mask based on the cosine similarity
@@ -922,7 +922,36 @@ class TemporalConsistancyLoss(torch.nn.Module):
 
         # reject ones with 5% of the distribution
         rejection_mask = cosine_similarity < -1.645
-        return rejection_mask
+        return rejection_mask, cosine_similarity
 
 
-        
+def bisimulation_loss(z_i, z_j, r_i, r_j,
+                      mu_i, mu_j,
+                      gamma):
+    """
+    Computes the batched bisimulation loss from Eq. (4) in the paper.
+
+    Args:
+        z_i, z_j: [batch, latent_dim] latent embeddings φ(s_i), φ(s_j)
+        r_i, r_j: [batch] rewards
+        mu_i, mu_j: [batch, latent_dim] predicted next-state Gaussian means
+        gamma: discount factor (scalar)
+
+    Returns:
+        Scalar loss (mean over batch)
+    """
+
+    # L1 distance between embeddings
+    latent_dist = torch.sum(torch.abs(z_i - z_j), dim=-1)  # [batch]
+
+    # Reward difference
+    reward_dist = torch.abs(r_i - r_j)  # [batch]
+
+
+    # 2-Wasserstein distance between Gaussians
+    mean_term = torch.sum((mu_i - mu_j) ** 2, dim=-1)  # ||μ_i - μ_j||_2^2
+    w2_dist = torch.sqrt(mean_term)  # W_2, not squared
+
+    # Final loss (Eq. 4)
+    loss_per_pair = (latent_dist - reward_dist - gamma * w2_dist) ** 2
+    return loss_per_pair.mean()

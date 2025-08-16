@@ -247,6 +247,18 @@ updates:
 
 # tcl
   use_tcl_loss: False
+  num_hidden: 1
+  K: 32
+  truncated_target: False
+  value_scale: False
+  value_adjust: False
+
+# dreamer_k_step
+  use_k_step_loss: False
+  skip_k: 4
+
+# bisimulation
+  use_bisimulation: False
 
 mlr:
   use_mlr_loss: True
@@ -328,7 +340,7 @@ tcl:
   use_tcl_loss: True
   tcl_config: {
       "latent_dim": 512,
-      "loss_type": "contrastive", # or contrastive
+      "loss_type": "predictive", # or contrastive
       "temperature": 0.1,
       "k": 32,
       "tau": 0.05,
@@ -336,3 +348,15 @@ tcl:
     }
   value_scale: False
   value_adjust: False
+  tcl_plot_every: 1000
+  num_consequtive: 10
+  plot_batch: 3
+
+dreamer_k_step:
+  use_k_step_loss: True
+  skip_k: 16
+  grad_heads: ['decoder', 'reward', 'cont', 'k_step_reward', 'k_step_cont']
+
+bisimulation:
+  use_bisimulation: True
+  use_decoder: False

@@ -44,9 +44,10 @@ class RewardEMA:
 
 
 class WorldModel(nn.Module):
-    def __init__(self, obs_space, act_space, step, config):
+    def __init__(self, obs_space, act_space, step, logger, config):
         super(WorldModel, self).__init__()
         self._step = step
+        self._logger = logger
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -83,9 +84,20 @@ class WorldModel(nn.Module):
         self.feat_size = feat_size
         self._get_extra_losses(config)
 
+
         self.heads["decoder"] = networks.MultiDecoder(
             feat_size, shapes, **config.decoder
         )
+
+        if config.use_bisimulation:
+            # delete the decoder to save memory
+            del self.heads["decoder"]
+            # breakpoint()
+            # remove grad_heads["decoder"] from config (it is a tuple)
+            config.grad_heads = [
+                name for name in config.grad_heads if name != "decoder"
+            ]
+
         self.heads["reward"] = networks.MLP(
             feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
@@ -110,6 +122,37 @@ class WorldModel(nn.Module):
             device=config.device,
             name="Cont",
         )
+
+        if config.use_k_step_loss:
+            # add two more heads. also add the head grads to config.grad_heads
+            self.heads["k_step_reward"] = networks.MLP(
+                feat_size,
+                (255,) if config.reward_head["dist"] == "symlog_disc" else (),
+                config.reward_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist=config.reward_head["dist"],
+                outscale=config.reward_head["outscale"],
+                device=config.device,
+                name="KStepReward",
+            )
+
+            self.heads["k_step_cont"] = networks.MLP(
+                 feat_size,
+                (),
+                config.cont_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist="binary",
+                outscale=config.cont_head["outscale"],
+                device=config.device,
+                name="KStepCont",
+            )
+
+            self.skip_k = config.skip_k
+
         for name in config.grad_heads:
             assert name in self.heads, name
         self._model_opt = tools.Optimizer(
@@ -130,6 +173,7 @@ class WorldModel(nn.Module):
             reward=config.reward_head["loss_scale"],
             cont=config.cont_head["loss_scale"],
         )
+        self.train_count = 0
 
     def random_pixel_shift(self, frames, shift_prob):
         # Generate a mask where each pixel is marked to be shifted or not based on probability
@@ -196,7 +240,22 @@ class WorldModel(nn.Module):
                     )
                 if self._use_updated_atc_loss:
                     _mets.update(self.atc.calculate_loss(data["image"]))
-                # embed = self.encoder(data)
+
+                if self._use_bisimulation:
+                    B, T = embed.shape[:2]
+                    shuffled_index = torch.randperm(embed.shape[1])
+                    shuffled_embed = embed[:, shuffled_index, :]
+                    shuffled_reward = data['reward'][:, shuffled_index]
+                    embed_loss = -torch.nn.functional.mse_loss(
+                        embed.reshape(B*T, -1),
+                        shuffled_embed.reshape(B*T, -1),
+                    )
+                    reward_loss = torch.nn.functional.mse_loss(
+                        data["reward"].reshape(-1, 1),
+                        shuffled_reward.reshape(-1, 1),
+                    )
+                    _mets.update({"bisimulation_loss": embed_loss + reward_loss})
+                
                 post, prior = self.dynamics.observe(
                     embed, data["action"], data["is_first"]
                 )
@@ -243,21 +302,37 @@ class WorldModel(nn.Module):
                 
                 if self._use_tcl_loss:
                     _mets.update(self.tcl.calculate_loss(post["deter"]))
+                    if self.train_count % self._config.tcl_plot_every == 0:
+                        max_image, min_image = self._evaluate_tcl(prior, data["image"])
+                        self._logger.image("bottom_linearity", to_np(max_image))
+                        self._logger.image("top_linearity", to_np(min_image))
+
+                    
+
 
                 preds = {}
                 for name, head in self.heads.items():
                     grad_head = name in self._config.grad_heads
                     feat = self.dynamics.get_feat(post)
                     feat = feat if grad_head else feat.detach()
-                    pred = head(feat)
+                    if "k_step" in name and self._use_k_step_loss:
+                        pred = head(feat[:, :-self.skip_k])
+                    else:
+                        pred = head(feat)
                     if type(pred) is dict:
                         preds.update(pred)
                     else:
                         preds[name] = pred
                 losses = {}
                 for name, pred in preds.items():
-                    loss = -pred.log_prob(data[name])
-                    assert loss.shape == embed.shape[:2], (name, loss.shape)
+                    if "k_step" in name and self._use_k_step_loss:
+                        key_name = name.replace("k_step_", "")
+                        loss = -pred.log_prob(data[key_name][:, self.skip_k:])
+                        loss = torch.cat([loss, torch.zeros_like(loss[:, :self.skip_k])], dim=1)
+                    else:
+                        loss = -pred.log_prob(data[name])
+
+                    # assert loss.shape == embed.shape[:2], (name, loss.shape)
                     losses[name] = loss
                 scaled = {
                     key: value * self._scales.get(key, 1.0)
@@ -274,6 +349,7 @@ class WorldModel(nn.Module):
                     or self._use_updated_atc_loss
                     or self._use_scl_loss
                     or self._use_tcl_loss
+                    or self._use_bisimulation
                 ):
                     for v in _mets.values():
                         model_loss += v
@@ -317,6 +393,7 @@ class WorldModel(nn.Module):
         #     mahalanobis_distance.std()
         # )
 
+
         if (
             self._use_acro_loss
             or self._use_icm_loss
@@ -343,14 +420,71 @@ class WorldModel(nn.Module):
                 kl=kl_value,
                 postent=self.dynamics.get_dist(post).entropy(),
             )
-        # Doesn't work:(
-        # if self._use_atc_loss:
-        #     embed = self.encoder.forward_with_target(data)
-        #     post, prior = self.dynamics.observe(
-        #         embed, data["action"], data["is_first"]
-        #     )
+
         post = {k: v.detach() for k, v in post.items()}
+        self.train_count += 1
         return post, context, metrics
+
+    def _evaluate_tcl(self, prior, images):
+        rejection_mask, dis_distance2_imagined = self._get_rejection_mask_and_imagined_distance_from_evaluator(prior["deter"])
+        total_error = dis_distance2_imagined.squeeze(-1).unfold(dimension = -1, size=self._config.num_consequtive, step=1).sum(-1)
+        max_indices, min_indices = self.get_topk_minmax_2d(total_error, self._config.plot_batch)
+
+        prior_feat = self.dynamics.get_feat(prior)
+        max_priors, min_priors = self._gather_consequtive_features(prior_feat, max_indices, self._config.num_consequtive), self._gather_consequtive_features(prior_feat, min_indices, self._config.num_consequtive)
+        max_images, min_images = self._gather_consequtive_features(images, max_indices, self._config.num_consequtive), self._gather_consequtive_features(images, min_indices, self._config.num_consequtive)
+        max_images_pred, min_images_pred = self.heads['decoder'](max_priors)["image"].mode(), self.heads['decoder'](min_priors)["image"].mode()
+
+        max_images, min_images = torch.cat([max_images, max_images_pred], dim=2), torch.cat([min_images, min_images_pred], dim=2)
+        return rearrange(max_images, "B T H W C -> (B H) (T W) C"), rearrange(min_images, "B T H W C -> (B H) (T W) C")
+
+    def _gather_consequtive_features(self, features, indices, num_consequtive):
+        # features are (B, T, _) indices are (num_plots, 2), 
+        rows = indices[:, 0].repeat_interleave(num_consequtive)
+        cols = indices[:, 1].unsqueeze(-1) + torch.arange(1, num_consequtive+1, device=indices.device)
+        return features[rows, cols.flatten()].reshape(-1, num_consequtive, *features.shape[2:])
+
+
+    
+    def get_topk_minmax_2d(self, values: torch.Tensor, k: int):
+    
+        assert values.ndim == 2, "Input tensor must be 2D"
+
+        flat = values.flatten()
+
+        # Top-K max
+        topk_max_vals, topk_max_flat_idx = torch.topk(flat, k)
+        topk_max_indices = torch.stack((
+            topk_max_flat_idx // values.size(1),
+            topk_max_flat_idx % values.size(1)
+        ), dim=1)
+
+        # Top-K min
+        topk_min_vals, topk_min_flat_idx = torch.topk(flat, k, largest=False)
+        topk_min_indices = torch.stack((
+            topk_min_flat_idx // values.size(1),
+            topk_min_flat_idx % values.size(1)
+        ), dim=1)
+
+        return topk_max_indices, topk_min_indices
+
+
+    def _get_rejection_mask_and_imagined_distance_from_evaluator(self, imag_feat):
+        imag_t, imag_t_plus_1 = imag_feat[:, :-1], imag_feat[:, 1:]
+        B, T, _ = imag_t.shape
+        imag_t, imag_t_plus_1 = imag_t.reshape(B*T, -1), imag_t_plus_1.reshape(
+            B*T, -1
+        )
+        rejection_mask, dist_distance2imagined = (
+            self.evaluator.calculate_rejection_mask_and_distance_from_generated_outputs(
+                imag_t, imag_t_plus_1
+            ) if hasattr(self, "evaluator") else self.tcl.calculate_rejection_mask_and_distance_from_generated_outputs(
+                imag_t, imag_t_plus_1
+            ) 
+        )
+        rejection_mask = rejection_mask.reshape(B, T, -1)
+        dist_distance2imagined = dist_distance2imagined.reshape(B, T, -1)
+        return rejection_mask, dist_distance2imagined
 
     def _calculate_explained_vairance_ratio(self, feat):
         x = feat.reshape(-1, feat.shape[-1])
@@ -469,6 +603,9 @@ class WorldModel(nn.Module):
         states, _ = self.dynamics.observe(
             embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
         )
+        if "decoder" not in self.heads:
+            return torch.zeros(6, 5, 64, 64, 3).to(self._config.device)
+        
         recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
             :6
         ]
@@ -505,6 +642,11 @@ class WorldModel(nn.Module):
         return torch.cosine_similarity(lhs, feats, dim=-1).mean(0)
 
     def _get_extra_losses(self, config):
+        self._use_bisimulation = config.use_bisimulation
+       
+        self._use_k_step_loss = config.use_k_step_loss
+    
+
         self._use_tcl_loss = config.use_tcl_loss
         if self._use_tcl_loss:
             self.tcl = TemporalConsistancyLoss(
@@ -694,49 +836,90 @@ class ImagBehavior(nn.Module):
                 )
                 reward = objective(imag_feat, imag_state, imag_action)
 
+                if self._config.truncated_target:
+                    rejection_mask, dist_distance2imagined = (
+                            self._get_rejection_mask_and_imagined_distance_from_evaluator(
+                                imag_feat
+                            )
+                        )
+                    metrics["rejection_rate"] = to_np(
+                        torch.mean(rejection_mask.float())
+                    )
+                else:
+                    rejection_mask = None
+                
                 actor_ent = self.actor(imag_feat).entropy()
                 # actor_ent = self._get_weighted_entropy(imag_feat)
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
                 # this target is not scaled by ema or sym_log.
-                target, weights, base = self._compute_target(
-                    imag_feat, imag_state, reward
+                target, weights, base, bad_target = self._compute_target(
+                    imag_feat, imag_state, reward, rejection_mask
                 )
+                
                 actor_loss, mets = self._compute_actor_loss(
                     imag_feat,
                     imag_action,
-                    target,
+                    bad_target,
                     weights,
                     base,
                 )
-                actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
-                if (
-                    self._config.use_evaluator or self._config.use_discriminator
-                ) and self._config.policy_adjust:
-                    rejection_mask, dist_distance2imagined = (
-                        self._get_rejection_mask_and_imagined_distance_from_evaluator(
-                            imag_feat
-                        )
-                    )
-                    actor_loss[rejection_mask] = 0.0
-                    actor_loss = (
-                        torch.sum(actor_loss) / (actor_loss != 0.0).sum()
-                        if (actor_loss != 0.0).sum() > 0
-                        else actor_loss.mean()
-                    )  # zero division
+
+                mask_nan_target = torch.isnan(torch.stack(target, dim=1))
+                if mask_nan_target.any():
+                    actor_loss = actor_loss[~mask_nan_target].mean() - torch.mean(self._config.actor["entropy"] * actor_ent[:-1, ..., None])
                 else:
-                    actor_loss = torch.mean(actor_loss)
+                    actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+                    
+                    if (
+                        self._config.use_evaluator or self._config.use_discriminator
+                    ) and self._config.policy_adjust:
+                        rejection_mask, dist_distance2imagined = (
+                            self._get_rejection_mask_and_imagined_distance_from_evaluator(
+                                imag_feat
+                            )
+                        )
+                        actor_loss[rejection_mask] = 0.0
+                        actor_loss = (
+                            torch.sum(actor_loss) / (actor_loss != 0.0).sum()
+                            if (actor_loss != 0.0).sum() > 0
+                            else actor_loss.mean()
+                        )  # zero division
+                    else:
+                        actor_loss = torch.mean(actor_loss)
                 metrics.update(mets)
                 value_input = imag_feat
 
+        if torch.isnan(torch.stack(target, dim=1)).all():
+            mask_nan = torch.isnan(torch.stack(target, dim=1))
+            metrics.update(tools.tensorstats(reward, "imag_reward"))
+            if self._config.actor["dist"] in ["onehot"]:
+                metrics.update(
+                    tools.tensorstats(
+                        torch.argmax(imag_action, dim=-1).float(), "imag_action"
+                    )
+                )
+            else:
+                metrics.update(tools.tensorstats(imag_action, "imag_action"))
+            metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
+            with tools.RequiresGrad(self):
+                metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
+            return imag_feat, imag_state, imag_action, weights, metrics
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
                 value = self.value(value_input[:-1].detach())
                 target = torch.stack(target, dim=1)
+                mask_nan = torch.isnan(target)
                 # (time, batch, 1), (time, batch, 1) -> (time, batch)
-                value_loss = -value.log_prob(target.detach())
+                target_clone = target.clone()
+                target_clone[torch.isnan(target)] = 0.0
+                value_loss = -value.log_prob(target_clone.detach())
+                value_loss[mask_nan.squeeze(-1)] = torch.nan
                 slow_target = self._slow_value(value_input[:-1].detach())
+               
                 if self._config.critic["slow_target"]:
-                    value_loss -= value.log_prob(slow_target.mode().detach())
+                    slow_target_loss = value.log_prob(slow_target.mode().detach())
+                    slow_target_loss[mask_nan.squeeze(-1)] = torch.nan
+                    value_loss -= slow_target_loss
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = weights[:-1] * value_loss[:, :, None]
 
@@ -769,20 +952,17 @@ class ImagBehavior(nn.Module):
                     ):
                         metrics[f"rejection_rate/timestep_{i}"] = float(rejection_rate)
 
-                    if dist_distance2imagined is not None:
-                        metrics["debug/dist_distance2imagined_bin0"] = (
-                            dist_distance2imagined[:, 0].mean().item() * 5
-                        )  # by consutrcution, this is 5[]
                     value_loss = (
                         torch.sum(value_loss) / (value_loss != 0.0).sum()
                         if (value_loss != 0.0).sum() > 0
                         else value_loss.mean()
                     )  # zero division
                 else:
-                    value_loss = value_loss.mean()
-
+                    
+                    value_loss = value_loss[~mask_nan].mean()
+        
         metrics.update(tools.tensorstats(value.mode(), "value"))
-        metrics.update(tools.tensorstats(target, "target"))
+        metrics.update(tools.tensorstats(target[~mask_nan], "target"))
         metrics.update(tools.tensorstats(reward, "imag_reward"))
         if self._config.actor["dist"] in ["onehot"]:
             metrics.update(
@@ -797,17 +977,8 @@ class ImagBehavior(nn.Module):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
 
-        # imag_feat_cosine_similarity = (
-        #     self._world_model.calculate_pairwise_cosine_similarity(
-        #         imag_feat.permute(1, 0, 2)
-        #     )
-        # )
-        # for i in range(imag_feat_cosine_similarity.shape[0]):
-        #     metrics[f"imag_feat/cosine_dist_{i}"] = to_np(
-        #         imag_feat_cosine_similarity[i]
-        #     )
         return imag_feat, imag_state, imag_action, weights, metrics
-
+    
     def _get_weighted_entropy(self, imag_feat):
         w = self._get_weights_for_entropy(imag_feat)
         w = torch.cat(
@@ -874,14 +1045,14 @@ class ImagBehavior(nn.Module):
 
         return feats, states, actions
 
-    def _compute_target(self, imag_feat, imag_state, reward):
+    def _compute_target(self, imag_feat, imag_state, reward, rejection_mask=None):
         if "cont" in self._world_model.heads:
             inp = self._world_model.dynamics.get_feat(imag_state)
             discount = self._config.discount * self._world_model.heads["cont"](inp).mean
         else:
             discount = self._config.discount * torch.ones_like(reward)
         value = self.value(imag_feat).mode()
-        target = tools.lambda_return(
+        bad_target = tools.lambda_return(
             reward[1:],
             value[:-1],
             discount[1:],
@@ -889,10 +1060,21 @@ class ImagBehavior(nn.Module):
             lambda_=self._config.discount_lambda,
             axis=0,
         )
+        target = tools.lambda_return_lol(
+            reward[1:],
+            value[:-1],
+            discount[1:],
+            bootstrap=value[-1],
+            lambda_=self._config.discount_lambda,
+            axis=0,
+            mask_reject=rejection_mask
+        )
+ 
+        # breakpoint()
         weights = torch.cumprod(
             torch.cat([torch.ones_like(discount[:1]), discount[:-1]], 0), 0
         ).detach()
-        return target, weights, value[:-1]
+        return target, weights, value[:-1], bad_target
 
     def _compute_actor_loss(
         self,
@@ -907,22 +1089,28 @@ class ImagBehavior(nn.Module):
         policy = self.actor(inp)
         # Q-val for actor is not transformed using symlog
         target = torch.stack(target, dim=1)
+        mask_nan_target = torch.isnan(target)
         if self._config.reward_EMA:
-            offset, scale = self.reward_ema(target, self.ema_vals)
+            offset, scale = self.reward_ema(target[~mask_nan_target], self.ema_vals)
+            
             normed_target = (target - offset) / scale
             normed_base = (base - offset) / scale
             adv = normed_target - normed_base
-            metrics.update(tools.tensorstats(normed_target, "normed_target"))
+            metrics.update(tools.tensorstats(normed_target[~mask_nan_target], "normed_target"))
             metrics["EMA_005"] = to_np(self.ema_vals[0])
             metrics["EMA_095"] = to_np(self.ema_vals[1])
 
         if self._config.imag_gradient == "dynamics":
             actor_target = adv
+            actor_target[mask_nan_target] = 0.0
         elif self._config.imag_gradient == "reinforce":
+            advantage = (target - self.value(imag_feat[:-1]).mode()).detach()
+            advantage[mask_nan_target] = 0.0
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]
-                * (target - self.value(imag_feat[:-1]).mode()).detach()
+                * advantage.detach()
             )
+            actor_target[mask_nan_target] = 0.0
         elif self._config.imag_gradient == "both":
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]
@@ -930,10 +1118,18 @@ class ImagBehavior(nn.Module):
             )
             mix = self._config.imag_gradient_mix
             actor_target = mix * target + (1 - mix) * actor_target
+            actor_target[mask_nan_target] = 0.0
             metrics["imag_gradient_mix"] = mix
         else:
             raise NotImplementedError(self._config.imag_gradient)
+ 
         actor_loss = -weights[:-1] * actor_target
+        # if mask_nan_target.any():
+            # breakpoint(
+        if torch.any(policy.logits.isnan()):
+            print("actor logits nan")
+        if torch.any(policy.logits.isinf()):
+            print("actor logits inf")
         return actor_loss, metrics
 
     def _update_slow_target(self):
