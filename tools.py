@@ -239,7 +239,7 @@ def simulate(
 
                     score = sum(eval_scores) / len(eval_scores)
                     length = sum(eval_lengths) / len(eval_lengths)
-                    logger.video(f"eval_policy", np.array(video)[None])
+                    # logger.video(f"eval_policy", np.array(video)[None])  # disabled: wandb gif encoding intermittently hangs the run
 
                     if len(eval_scores) >= episodes and not eval_done:
                         logger.scalar(f"eval_return", score)
@@ -729,48 +729,6 @@ def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
         returns = returns.permute(dims)
     return returns
 
-def lambda_return_lol(reward, value, pcont, bootstrap, lambda_, axis, mask_reject=None):
-    assert len(reward.shape) == len(value.shape), (reward.shape, value.shape)
-    if isinstance(pcont, (int, float)):
-        pcont = pcont * torch.ones_like(reward)
-    dims = list(range(len(reward.shape)))
-    dims = [axis] + dims[1:axis] + [0] + dims[axis + 1:]
-    value_ = value.clone().detach() 
-    if axis != 0:
-        reward = reward.permute(dims)
-        value = value.permute(dims)
-        pcont = pcont.permute(dims)
-    if bootstrap is None:
-        bootstrap = torch.zeros_like(value[-1])
-    if mask_reject is not None:
-        bootstrap[mask_reject[-1].reshape(bootstrap.shape)] = torch.nan
-    next_values = torch.cat([value[1:], bootstrap[None]], 0)
-    if mask_reject is not None:
-        next_values[mask_reject.reshape(next_values.shape)] = torch.nan
-    inputs = reward + pcont * next_values * (1 - lambda_)
-    def accumulate(agg, input, pcont, value):
-        out = input + pcont * lambda_ * agg
-        mask_nan = torch.isnan(out)
-        if mask_nan.any():
-            out[mask_nan] = value[mask_nan]
-        return out
-    returns = sequence_scan(accumulate, bootstrap, inputs, pcont, value, reverse=True)
-    if mask_reject is not None and mask_reject.any():
-        mask_nan_returns = torch.isnan(returns)
-        if mask_nan_returns.any():
-            try:
-                assert mask_reject[mask_nan_returns].all()
-            except:
-                breakpoint()
-        mask_should_be_same_value = mask_reject & ~mask_nan_returns
-        if mask_should_be_same_value.any():
-            assert (returns[mask_should_be_same_value] == value[mask_should_be_same_value]).all()
-        returns[mask_reject.flatten(1)] = torch.nan
-    if axis != 0:
-        returns = returns.permute(dims)
-
-    return returns.unbind(axis=1)
-
 class Optimizer:
     def __init__(
         self,
@@ -836,6 +794,9 @@ def args_type(default):
             return float(x) if ("e" in x or "." in x) else int(x)
         if isinstance(default, (list, tuple)):
             return tuple(args_type(default[0])(y) for y in x.split(","))
+        # PyYAML (>=6) parses scientific notation like 4e5 / 1e-4 as str; coerce to float.
+        if isinstance(default, str) and re.fullmatch(r"[-+]?(\d+\.?\d*|\.\d+)[eE][-+]?\d+", x):
+            return float(x)
         return type(default)(x)
 
     def parse_object(x):
@@ -844,6 +805,21 @@ def args_type(default):
         return x
 
     return lambda x: parse_string(x) if isinstance(x, str) else parse_object(x)
+
+
+_SCI_RE = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)[eE][-+]?\d+")
+
+
+def coerce_numbers(x):
+    """Recursively coerce scientific-notation strings (e.g. '3e-4') to float.
+    PyYAML>=6 parses these as str; config dicts (actor, critic, ...) need them numeric."""
+    if isinstance(x, dict):
+        return {k: coerce_numbers(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(coerce_numbers(v) for v in x)
+    if isinstance(x, str) and _SCI_RE.fullmatch(x):
+        return float(x)
+    return x
 
 
 def static_scan(fn, inputs, start):

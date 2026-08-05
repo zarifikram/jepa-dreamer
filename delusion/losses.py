@@ -820,6 +820,7 @@ class TemporalConsistancyLoss(torch.nn.Module):
         self.tau = config["tau"]
         self.loss_type = config["loss_type"]
         self.delta = config["delta"]
+        self.k_sigma = config.get("k_sigma", 1.645)
         if self.loss_type == "predictive":
             self.predictor = torch.nn.Linear(self.latent_dim, 2*self.latent_dim) # mu and logvar
         self.mu, self.std = None, None
@@ -911,8 +912,8 @@ class TemporalConsistancyLoss(torch.nn.Module):
         predicted_deter_t_plus_one = self._calculate_predicted_positive(deter_t) # (B, k, D)
         prediction_error = (deter_t_plus_one.unsqueeze(1) - predicted_deter_t_plus_one).pow(2).mean(dim=[1, 2])
         prediction_error = (prediction_error - self.mu) / self.std
-        # reject ones with 5% of the distribution
-        rejection_mask = prediction_error > 1.645
+        # reject transitions beyond k_sigma std of the train-time consistency error
+        rejection_mask = prediction_error > self.k_sigma
         return rejection_mask, prediction_error
 
     def _calculate_rejection_mask_contrastive(self, s_t, s_t_plus_one):
@@ -920,8 +921,8 @@ class TemporalConsistancyLoss(torch.nn.Module):
         # both s_t and s_t plus one is (B, d). Calculate cosine similarity to get (B,)
         cosine_similarity = (torch.nn.functional.cosine_similarity(s_t, s_t_plus_one, dim=-1) / self.tau - self.mu) / self.std
 
-        # reject ones with 5% of the distribution
-        rejection_mask = cosine_similarity < -1.645
+        # reject transitions beyond k_sigma std of the train-time consistency error
+        rejection_mask = cosine_similarity < -self.k_sigma
         return rejection_mask, cosine_similarity
 
 

@@ -4,6 +4,13 @@ logdir*
 vis_*
 result*
 
+# internal rebuttal working docs (kept local, not for the public repo)
+analysis/rebuttal_notes.md
+analysis/rebuttal_combined.md
+
+# regenerable analysis caches
+*.npz
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

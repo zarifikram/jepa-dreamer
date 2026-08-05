@@ -222,7 +222,9 @@ def make_env(config, mode, id):
 
 def main(config):
     
-    wandb.init(config=config, project=config.wandb_proj, name=config.wandb_exp, resume='never', mode='online' if config.wandb_enabled else "disabled")
+    for _k in list(vars(config)):
+        setattr(config, _k, tools.coerce_numbers(getattr(config, _k)))
+    wandb.init(config=config, project=config.wandb_proj, entity=config.wandb_entity or None, name=config.wandb_exp, resume='never', mode='online' if config.wandb_enabled else "disabled")
 
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:

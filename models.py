@@ -301,7 +301,8 @@ class WorldModel(nn.Module):
                     )
                 
                 if self._use_tcl_loss:
-                    _mets.update(self.tcl.calculate_loss(post["deter"]))
+                    deter_tcl = post["deter"].detach() if self._config.consistency_detach else post["deter"]
+                    _mets.update(self.tcl.calculate_loss(deter_tcl))
                     if self.train_count % self._config.tcl_plot_every == 0:
                         max_image, min_image = self._evaluate_tcl(prior, data["image"])
                         self._logger.image("bottom_linearity", to_np(max_image))
@@ -649,6 +650,7 @@ class WorldModel(nn.Module):
 
         self._use_tcl_loss = config.use_tcl_loss
         if self._use_tcl_loss:
+            config.tcl_config["k_sigma"] = config.k_sigma
             self.tcl = TemporalConsistancyLoss(
                 config.tcl_config,
             )
@@ -836,90 +838,48 @@ class ImagBehavior(nn.Module):
                 )
                 reward = objective(imag_feat, imag_state, imag_action)
 
-                if self._config.truncated_target:
-                    rejection_mask, dist_distance2imagined = (
-                            self._get_rejection_mask_and_imagined_distance_from_evaluator(
-                                imag_feat
-                            )
-                        )
-                    metrics["rejection_rate"] = to_np(
-                        torch.mean(rejection_mask.float())
-                    )
-                else:
-                    rejection_mask = None
-                
                 actor_ent = self.actor(imag_feat).entropy()
-                # actor_ent = self._get_weighted_entropy(imag_feat)
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
                 # this target is not scaled by ema or sym_log.
-                target, weights, base, bad_target = self._compute_target(
-                    imag_feat, imag_state, reward, rejection_mask
+                target, weights, base = self._compute_target(
+                    imag_feat, imag_state, reward
                 )
-                
                 actor_loss, mets = self._compute_actor_loss(
                     imag_feat,
                     imag_action,
-                    bad_target,
+                    target,
                     weights,
                     base,
                 )
-
-                mask_nan_target = torch.isnan(torch.stack(target, dim=1))
-                if mask_nan_target.any():
-                    actor_loss = actor_loss[~mask_nan_target].mean() - torch.mean(self._config.actor["entropy"] * actor_ent[:-1, ..., None])
-                else:
-                    actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
-                    
-                    if (
-                        self._config.use_evaluator or self._config.use_discriminator
-                    ) and self._config.policy_adjust:
-                        rejection_mask, dist_distance2imagined = (
-                            self._get_rejection_mask_and_imagined_distance_from_evaluator(
-                                imag_feat
-                            )
+                actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+                if (
+                    self._config.use_evaluator or self._config.use_discriminator
+                ) and self._config.policy_adjust:
+                    rejection_mask, dist_distance2imagined = (
+                        self._get_rejection_mask_and_imagined_distance_from_evaluator(
+                            imag_feat
                         )
-                        actor_loss[rejection_mask] = 0.0
-                        actor_loss = (
-                            torch.sum(actor_loss) / (actor_loss != 0.0).sum()
-                            if (actor_loss != 0.0).sum() > 0
-                            else actor_loss.mean()
-                        )  # zero division
-                    else:
-                        actor_loss = torch.mean(actor_loss)
+                    )
+                    actor_loss[rejection_mask] = 0.0
+                    actor_loss = (
+                        torch.sum(actor_loss) / (actor_loss != 0.0).sum()
+                        if (actor_loss != 0.0).sum() > 0
+                        else actor_loss.mean()
+                    )  # zero division
+                else:
+                    actor_loss = torch.mean(actor_loss)
                 metrics.update(mets)
                 value_input = imag_feat
 
-        if torch.isnan(torch.stack(target, dim=1)).all():
-            mask_nan = torch.isnan(torch.stack(target, dim=1))
-            metrics.update(tools.tensorstats(reward, "imag_reward"))
-            if self._config.actor["dist"] in ["onehot"]:
-                metrics.update(
-                    tools.tensorstats(
-                        torch.argmax(imag_action, dim=-1).float(), "imag_action"
-                    )
-                )
-            else:
-                metrics.update(tools.tensorstats(imag_action, "imag_action"))
-            metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
-            with tools.RequiresGrad(self):
-                metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
-            return imag_feat, imag_state, imag_action, weights, metrics
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
                 value = self.value(value_input[:-1].detach())
                 target = torch.stack(target, dim=1)
-                mask_nan = torch.isnan(target)
                 # (time, batch, 1), (time, batch, 1) -> (time, batch)
-                target_clone = target.clone()
-                target_clone[torch.isnan(target)] = 0.0
-                value_loss = -value.log_prob(target_clone.detach())
-                value_loss[mask_nan.squeeze(-1)] = torch.nan
+                value_loss = -value.log_prob(target.detach())
                 slow_target = self._slow_value(value_input[:-1].detach())
-               
                 if self._config.critic["slow_target"]:
-                    slow_target_loss = value.log_prob(slow_target.mode().detach())
-                    slow_target_loss[mask_nan.squeeze(-1)] = torch.nan
-                    value_loss -= slow_target_loss
+                    value_loss -= value.log_prob(slow_target.mode().detach())
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = weights[:-1] * value_loss[:, :, None]
 
@@ -958,11 +918,10 @@ class ImagBehavior(nn.Module):
                         else value_loss.mean()
                     )  # zero division
                 else:
-                    
-                    value_loss = value_loss[~mask_nan].mean()
-        
+                    value_loss = torch.mean(value_loss)
+
         metrics.update(tools.tensorstats(value.mode(), "value"))
-        metrics.update(tools.tensorstats(target[~mask_nan], "target"))
+        metrics.update(tools.tensorstats(target, "target"))
         metrics.update(tools.tensorstats(reward, "imag_reward"))
         if self._config.actor["dist"] in ["onehot"]:
             metrics.update(
@@ -1045,14 +1004,14 @@ class ImagBehavior(nn.Module):
 
         return feats, states, actions
 
-    def _compute_target(self, imag_feat, imag_state, reward, rejection_mask=None):
+    def _compute_target(self, imag_feat, imag_state, reward):
         if "cont" in self._world_model.heads:
             inp = self._world_model.dynamics.get_feat(imag_state)
             discount = self._config.discount * self._world_model.heads["cont"](inp).mean
         else:
             discount = self._config.discount * torch.ones_like(reward)
         value = self.value(imag_feat).mode()
-        bad_target = tools.lambda_return(
+        target = tools.lambda_return(
             reward[1:],
             value[:-1],
             discount[1:],
@@ -1060,21 +1019,10 @@ class ImagBehavior(nn.Module):
             lambda_=self._config.discount_lambda,
             axis=0,
         )
-        target = tools.lambda_return_lol(
-            reward[1:],
-            value[:-1],
-            discount[1:],
-            bootstrap=value[-1],
-            lambda_=self._config.discount_lambda,
-            axis=0,
-            mask_reject=rejection_mask
-        )
- 
-        # breakpoint()
         weights = torch.cumprod(
             torch.cat([torch.ones_like(discount[:1]), discount[:-1]], 0), 0
         ).detach()
-        return target, weights, value[:-1], bad_target
+        return target, weights, value[:-1]
 
     def _compute_actor_loss(
         self,
@@ -1089,28 +1037,22 @@ class ImagBehavior(nn.Module):
         policy = self.actor(inp)
         # Q-val for actor is not transformed using symlog
         target = torch.stack(target, dim=1)
-        mask_nan_target = torch.isnan(target)
         if self._config.reward_EMA:
-            offset, scale = self.reward_ema(target[~mask_nan_target], self.ema_vals)
-            
+            offset, scale = self.reward_ema(target, self.ema_vals)
             normed_target = (target - offset) / scale
             normed_base = (base - offset) / scale
             adv = normed_target - normed_base
-            metrics.update(tools.tensorstats(normed_target[~mask_nan_target], "normed_target"))
+            metrics.update(tools.tensorstats(normed_target, "normed_target"))
             metrics["EMA_005"] = to_np(self.ema_vals[0])
             metrics["EMA_095"] = to_np(self.ema_vals[1])
 
         if self._config.imag_gradient == "dynamics":
             actor_target = adv
-            actor_target[mask_nan_target] = 0.0
         elif self._config.imag_gradient == "reinforce":
-            advantage = (target - self.value(imag_feat[:-1]).mode()).detach()
-            advantage[mask_nan_target] = 0.0
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]
-                * advantage.detach()
+                * (target - self.value(imag_feat[:-1]).mode()).detach()
             )
-            actor_target[mask_nan_target] = 0.0
         elif self._config.imag_gradient == "both":
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]
@@ -1118,14 +1060,11 @@ class ImagBehavior(nn.Module):
             )
             mix = self._config.imag_gradient_mix
             actor_target = mix * target + (1 - mix) * actor_target
-            actor_target[mask_nan_target] = 0.0
             metrics["imag_gradient_mix"] = mix
         else:
             raise NotImplementedError(self._config.imag_gradient)
- 
+
         actor_loss = -weights[:-1] * actor_target
-        # if mask_nan_target.any():
-            # breakpoint(
         if torch.any(policy.logits.isnan()):
             print("actor logits nan")
         if torch.any(policy.logits.isinf()):
